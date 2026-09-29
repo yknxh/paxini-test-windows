@@ -1,0 +1,174 @@
+# Paxini Gen3 정확도 검증 GUI 설정 (test-plan-v2.md 기준)
+# TODO 표시 항목은 실제 장비 확인 후 수정하세요.
+
+mode: sim                  # sim(가상 장비, 개발/리허설용) | hardware(실장비)
+output_dir: ./sessions     # 세션 산출물 위치 (이 파일 기준 상대경로 가능)
+
+# ── 센서 타입 / 인벤토리 ───────────────────────────────────────────
+sensor_types:
+  A:
+    label: "Elite Type A"
+    rated_N: 50            # TODO: 실제 정격(F.S.) 확인
+    rate_hz: 200           # 기대 샘플레이트 (RM1 판정용)
+    ball_tip: "볼 팁 Ø5"    # v2 기본 팁 (곡면용)
+    flat_tip: "평면 Ø10"    # v1 테스트에서만 사용
+    point_tip: "소구경 Ø3"
+  B:
+    label: "Elite Type B"
+    rated_N: 30            # TODO
+    rate_hz: 150
+    ball_tip: "볼 팁 Ø4"
+    flat_tip: "평면 20×20"
+    point_tip: "소구경 Ø5"
+
+# hand = 실사용 손 구성 (L/R). 다중 연결 테스트는 손 단위(4개)로 수행한다.
+# TODO: 실제 손별 구성 확인 후 수정 (test-plan-v2.md §9)
+sensors:
+  - {id: A1, type: A, channel: 0, hand: L}
+  - {id: A2, type: A, channel: 1, hand: L}
+  - {id: B1, type: B, channel: 4, hand: L}
+  - {id: B2, type: B, channel: 5, hand: L}
+  - {id: A3, type: A, channel: 2, hand: R}
+  - {id: A4, type: A, channel: 3, hand: R}
+  - {id: B3, type: B, channel: 6, hand: R}
+  - {id: B4, type: B, channel: 7, hand: R}
+
+# ── Force gauge (ZP-500N, 시리얼) ─────────────────────────────────
+gauge:
+  port: COM3               # TODO: 장치 관리자에서 확인
+  baudrate: 19200          # Imada ZP 호환 가정
+  mode: poll               # poll: 명령 보내고 응답 읽기 | stream: 게이지가 연속 송신
+  poll_command: "D\r"      # Imada 호환 '현재값 요청' 가정
+  poll_hz: 50
+  line_terminator: "\r"
+  line_regex: "([-+]?\\d+(?:\\.\\d+)?)"   # 응답에서 숫자 추출 (첫 그룹)
+  unit_scale: 1.0          # 게이지 단위 → N (kgf면 9.80665)
+  invert: false            # 압축(누름)이 + 가 되도록
+  timeout_s: 0.2
+  accuracy_N: 2.5          # ± 정확도. ZP-500N ±0.5 % F.S. 가정 (test-plan-v2.md §3.1)
+  low_force_valid_N: null  # 이 값 미만은 판정 보류. null 이면 accuracy_N × 4
+
+# ── PXSR CSV (공식 Windows 프로그램 출력) ─────────────────────────
+pxsr:
+  output_dir: "C:/PXSR/data"          # TODO: PXSR 저장 폴더
+  file_glob: "*.csv"
+  delimiter: ","
+  timestamp_col: timestamp            # 없으면 첫 열 사용
+  timestamp_unit: auto                # ms | s | auto
+  columns: {Fx: Fx, Fy: Fy, Fz: Fz, Tx: Tx, Ty: Ty, Tz: Tz}
+  channel_col: null                   # 한 파일에 여러 센서가 섞일 때 채널 열 이름
+  file_channel_regex: "ch(\\d+)"      # 센서별 파일일 때 파일명에서 채널 추출
+  fz_sign: 1                          # 누름이 + 가 되도록 (-1 이면 반전)
+  poll_interval_s: 0.2
+
+# ── 카메라 (영상 로깅) ────────────────────────────────────────────
+camera:
+  enabled: true
+  index: 0
+  width: 1280
+  height: 720
+  fps: 30
+  overlay: true            # 녹화 영상에 시간/단계/힘 값 오버레이
+
+# ── 절차 파라미터 ─────────────────────────────────────────────────
+procedure:
+  # v1 (계단식, S/M 테스트) — 정적 분동 계단이 필요할 때만 사용
+  hold_s: 5
+  analysis_window_s: 3
+  final_unload_s: 30
+  settle_tolerance_pct_fs: 2
+  settle_min_N: 0.3
+  settle_time_s: 1.0
+  auto_confirm: false
+  quick_factor: 1.0        # 리허설용 시간 배율 (0.1 = 10배 빠르게)
+  s3_weights_N: [0.5, 1, 2, 5, 10, 20]
+  positions: ["중앙", "상", "하", "좌", "우"]
+
+  # v2 (자유 스윕, R/RM 테스트) — test-plan-v2.md §4
+  v2:
+    head_zero_s: 20        # 세션 머리 무하중
+    tap_s: 8               # 싱크 탭 구간 (3회 탭)
+    tail_zero_s: 30        # 세션 꼬리 무하중 (영점 복귀)
+    r0_zero_s: 90          # R0 정지 세션
+    rm4_zero_s: 1800       # RM4 장시간
+    positions: ["정점", "+x", "-x", "+y", "-y"]      # R2 위치 스윕 (첫 항목 = 기준)
+    directions: ["+x", "-x", "+y", "-y"]             # R3 방향별. 없는 면은 지우세요
+    shear: false           # R3 에 전단(접착 패드) 구간 추가
+    rm3_static_N_hint: 5   # RM3 정하중 안내값 (측정하지 않음)
+
+    # 구간별 커버리지 목표 (이 값이 모두 차면 '종료 가능')
+    coverage:
+      apex:      {ramp: 3, pulse: 10, hold: 2, step: 5, bins: 8, bin_s: 2.0}
+      position:  {ramp: 2, pulse: 3, bins: 5, bin_s: 1.0}
+      direction: {ramp: 2, pulse: 3, bins: 5, bin_s: 1.0}
+      multi:     {ramp: 2, pulse: 5, bins: 5, bin_s: 1.0}
+
+    # 이벤트 검출·분류 임계 (test-plan-v2.md §6). 시간 값은 시간 배율에 따라 축소된다
+    detect:
+      contact_min_N: 0.5             # 접촉 판정 하한 (max(이 값, 노이즈 σ × k))
+      contact_sigma_k: 5
+      contact_min_s: 0.3             # 이보다 짧은 접촉은 무시
+      gap_merge_s: 0.15              # 이보다 짧은 끊김은 한 이벤트로 병합
+      quasi_static_pct_fs_per_s: 15  # |dG/dt| 가 이보다 작으면 준정적 샘플
+                                     # (10초 램프 = 10 %F.S./s 가 포함되도록. 동기 오차 10 ms 기준 0.15 %F.S.)
+      smooth_s: 0.2
+      bin_pct: 10                    # 구간(bin) 폭 (% F.S.)
+      merge_tol_s: 0.02              # 게이지 ↔ PXSR nearest merge 허용
+      ramp_min_peak_pct: 80          # 램프: 최고점 ≥ 이 값 (% F.S.)
+      ramp_min_edge_s: 6             # 램프: 10→90 % 상승·하강이 각각 ≥ 이 시간
+                                     # (10초 램프의 10→90 % 는 6~8초)
+      pulse_max_s: 4
+      pulse_peak_lo_pct: 10
+      pulse_peak_hi_pct: 80
+      hold_min_plateau_s: 20         # 홀드: 플라토 ≥ 이 시간
+      hold_plateau_tol_pct_fs: 3
+      step_max_rise_s: 0.15          # 스텝: 10→90 % 상승 ≤ 이 시간
+      step_min_peak_pct: 15
+      step_max_s: 12
+
+# ── 판정 기준 (test-plan-v2.md §7, 초안) ─────────────────────────
+criteria:
+  # v2
+  slope_tol: 0.03                # |F| = a·G + b 의 a 가 1 ± 이 값
+  direction_stability_deg: 3     # 램프 중 단위벡터 방향 편차 (95 %)
+  alignment_ratio_max: 1.05      # |F|/게이지 중앙값 (초과 시 측력 의심 경고)
+  simul_load_ratio: 2.0          # RM3 정하중 채널 1σ / 자체 노이즈 1σ
+  creep_pct_per_30s: 2
+  direction_spread_pct: 10
+  noise_std_N: 0.02
+  # v1 과 공용
+  nonlinearity_pct_fs: 3
+  hysteresis_pct_fs: 3
+  repeatability_pct_fs: 1
+  position_spread_pct: 10
+  crosstalk_pct: 5
+  zero_residual_N: 0.1
+  zero_recovery_s: 5
+  low_force_error_pct: 5
+  low_force_error_min_N: 0.1
+  channel_crosstalk_N: 0.1
+  multi_slope_diff_pct: 1
+  multi_delta_pct_fs: 1       # 같은 기준 하중(50 % F.S.)에서 읽음 차이
+  multi_offset_diff_N: 0.1    # 절편 차이 (참고 지표. 판정은 위 항목으로)
+  frame_drop_pct: 0.1
+  min_rate_ratio: 0.9
+
+# ── 시간 동기 ─────────────────────────────────────────────────────
+sync:
+  max_offset_s: 2.0        # 싱크 탭으로 추정할 PXSR↔게이지 최대 오프셋
+  min_correlation: 0.6
+
+# ── 가상 장비 (mode: sim) ─────────────────────────────────────────
+sim:
+  seed: 7
+  gauge_noise_N: 0.05
+  pxsr_clock_offset_s: 0.12   # PXSR 타임스탬프가 실제보다 늦게 찍히는 상황 재현
+  latency_s: 0.02
+  operator_ramp_s: 1.2
+  taxels: 16
+  camera_fps: 15
+  # v2 기하 모델 (곡면 · 정렬 오차 · 마찰)
+  surface_tilt_deg: 25        # 위치 스윕에서 가장자리 접촉면이 z 에서 기울어진 각
+  align_err_deg: 3.0          # 스탠드 정렬 오차 (정점·방향)
+  align_err_hand_deg: 7.0     # 손으로 누르는 위치 스윕의 정렬 오차
+  friction_w: 0.25            # 0 = 마찰 없음(|F|/G = 1/cos α), 1 = 완전 구속(비율 1)
