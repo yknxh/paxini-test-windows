@@ -16,6 +16,25 @@ from .pxsr import PxsrWatcher
 log = logging.getLogger("paxtest.devices")
 
 
+def _pid_alive(pid: int) -> bool:
+    """Windows 에서 os.kill(pid, 0) 은 존재 확인이 아니라 CTRL_C_EVENT 를 보내므로 OpenProcess 로 확인한다."""
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return k32.GetLastError() == 5   # 접근 거부 = 살아 있음
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259       # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _clean_stale_sim_dirs(root: Path) -> None:
     """끝난 리허설 프로세스가 남긴 가상 PXSR CSV 를 지운다 (수백 MB 까지 쌓인다)."""
     if not root.exists():
@@ -30,11 +49,8 @@ def _clean_stale_sim_dirs(root: Path) -> None:
             continue
         if pid == os.getpid():
             continue
-        try:
-            os.kill(pid, 0)        # 아직 살아 있으면 건드리지 않는다
+        if _pid_alive(pid):        # 아직 살아 있으면 건드리지 않는다
             continue
-        except OSError:
-            pass
         try:
             freed += sum(f.stat().st_size for f in d.glob("*"))
             shutil.rmtree(d)
@@ -60,14 +76,15 @@ class DeviceHub:
             sim = cfg.section("sim")
             seed = int(sim.get("seed", 7))
             self.sim_world = SimWorld(cfg.sensors, seed, geom=sim)
-            self.gauge = SimGauge(self.sim_world, float(sim.get("gauge_noise_N", 0.05)), seed=seed)
+            self.gauge = SimGauge(self.sim_world, float(sim.get("gauge_noise_N", 0.05)),
+                                  float(sim.get("gauge_rate_hz", 10)), seed=seed)
             # 프로세스마다 다른 폴더: 리허설을 동시에 두 개 돌려도 서로의 CSV 를 가져가지 않는다
             root = cfg.output_dir / "_sim_pxsr"
             _clean_stale_sim_dirs(root)
             self.pxsr_dir = root / f"p{os.getpid()}"
             # 가상 PXSR 파일 형식에 맞춘 파서 설정
             self.pxsr_overrides = {"timestamp_col": "timestamp", "timestamp_unit": "ms", "channel_col": None,
-                                   "file_channel_regex": r"ch(\d+)", "fz_sign": 1,
+                                   "file_channel_regex": r"ch(\d+)", "fz_sign": 1, "force_scale": 1.0, "taxel_geometry": None,
                                    "columns": {k: k for k in ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")}}
             self.sim_pxsr = SimPxsrWriter(self.sim_world, cfg.sensors, self.pxsr_dir, sim)
             self.sim_operator = SimOperator(self.sim_world, float(sim.get("operator_ramp_s", 1.2)),
@@ -118,17 +135,28 @@ class DeviceHub:
         """(t, [Fx,Fy,Fz]) — 채널 정보가 없는 단일 파일이면 채널 -1 을 사용."""
         ch = self.channel_of.get(sensor_id, -1)
         buf = self.pxsr.buffers.get(ch) or self.pxsr.buffers.get(-1)
+        if buf is None and len(self.pxsr.buffers) == 1:   # 채널 번호가 설정과 달라도 센서가 하나면 그걸 쓴다
+            buf = next(iter(self.pxsr.buffers.values()))
         if buf is None:
             import numpy as np
             return np.empty(0), np.empty((0, 3))
         return buf.snapshot(since=since)
 
+    def gauge_receiving(self, window: float = 2.0) -> bool:
+        """포트가 열려 있고 최근 window 초 안에 값이 들어왔는가 (포트만 열리고 게이지가 안 보내는 경우를 가려낸다)."""
+        t, _ = self.gauge.buffer.latest()
+        return self.gauge.status == "connected" and t is not None and time.time() - t < window
+
     def status_summary(self) -> dict:
         now = time.time()
         g = self.gauge
         cam = self.camera
+        if g.status == "connected" and not self.gauge_receiving():
+            gauge = ("no_data", f"{g.cfg.get('port', '') if hasattr(g, 'cfg') else ''} 열림 · 값 없음 (게이지 전원·출력 설정·케이블 확인)")
+        else:
+            gauge = (g.status, f"{g.buffer.rate(now):.0f} Hz" if g.status == "connected" else g.error)
         return {
-            "gauge": (g.status, f"{g.buffer.rate(now):.0f} Hz" if g.status == "connected" else g.error),
+            "gauge": gauge,
             "pxsr": (self.pxsr.status, f"{len(self.pxsr.active_files())} files · …/{self.pxsr_dir.name}"),
             "camera": ((cam.status, f"{cam.measured_fps:.0f} fps" if cam.status == "connected" else cam.error)
                        if cam else ("disabled", "")),
