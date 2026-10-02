@@ -14,7 +14,7 @@ import pandas as pd
 from ..config import Config
 from . import plots as P
 from .loader import load_session, step_stats
-from .metrics import ANALYZERS as ANALYZERS_V1, LABELS, Result, series_in, _colors
+from .metrics import ANALYZERS as ANALYZERS_V1, LABELS, LABELS_EN, Result, series_in, _colors
 from .metrics_v2 import ANALYZERS_V2          # LABELS 확장 포함
 from .report import CSS, badge, df_table, fmt, write_report
 
@@ -41,9 +41,15 @@ def analyze_session(session_dir: Path, cfg: Optional[Config] = None) -> Dict:
         res.notes.append(w)
     if sd.pxsr.empty:
         res.notes.append("PXSR 데이터가 없습니다. 결과 탭의 'PXSR 파일 지정' 으로 CSV 를 넣고 재분석하세요.")
-    # 1) 전체 시계열 (v2 는 합력 |F| 기준)
     code = sd.meta.get("test_code", "")
     v2 = code in V2_CODES
+    # 1) 테스트별 결과 (결과 그래프가 리포트 앞쪽에 온다)
+    try:
+        ANALYZERS[sd.meta["test_code"]](sd, st, res, crit, pdir)
+    except Exception as e:  # 분석 실패해도 리포트는 남긴다
+        log.exception("분석 실패")
+        res.notes.append(f"분석 중 오류: {e!r}")
+    # 2) 진단: 전체 기록 (v2 는 합력 |F| 기준)
     col = "Fmag" if v2 and "Fmag" in sd.pxsr else "Fz"
     colors = _colors(sd)
     sensors = {sid: (sd.sensor_df(sid)["t"].to_numpy(), sd.sensor_df(sid)[col].to_numpy())
@@ -51,9 +57,9 @@ def analyze_session(session_dir: Path, cfg: Optional[Config] = None) -> Dict:
     windows = [(r.t_start, r.t_end) for r in sd.events.itertuples()] if not sd.events.empty else []
     res.plot(P.timeseries(pdir / "timeseries.png", sd.t0,
                           (sd.gauge["t"].to_numpy(), sd.gauge["F"].to_numpy()),
-                          sensors, colors, windows, f"{code} 전체 기록", value_label=col),
-             "전체 기록. 회색 구간 = 측정·스윕 구간" + (" · 센서 값은 합력 |F|" if v2 else ""))
-    # 2) 싱크
+                          sensors, colors, windows, f"{code} full record", value_label=col),
+             "[진단] 전체 기록. 회색 구간 = 측정 구간" + (" · 센서 값은 합력 |F|" if v2 else ""))
+    # 3) 진단: 시간 동기
     if sd.sync.get("corr") is not None and not sd.events.empty:
         tap = sd.events[sd.events["action"] == "tap"]
         if len(tap):
@@ -67,13 +73,7 @@ def analyze_session(session_dir: Path, cfg: Optional[Config] = None) -> Dict:
             res.plot(P.sync_plot(pdir / "sync.png", e["t_start"], (sd.gauge.loc[gm, "t"].to_numpy(),
                                  sd.gauge.loc[gm, "F"].to_numpy()), (t, y), (raw_t + off, raw_y),
                                  sd.sync["offset_s"], sd.sync.get("corr")),
-                     "PXSR 타임스탬프를 게이지 시계에 맞춘 결과")
-    # 3) 테스트별
-    try:
-        ANALYZERS[sd.meta["test_code"]](sd, st, res, crit, pdir)
-    except Exception as e:  # 분석 실패해도 리포트는 남긴다
-        log.exception("분석 실패")
-        res.notes.append(f"분석 중 오류: {e!r}")
+                     f"[진단] PXSR 타임스탬프를 게이지 시계에 맞춘 결과 (방법: {sd.sync.get('method')})")
 
     judged = [c["passed"] for c in res.checks if c["passed"] is not None]
     overall = "N/A" if not judged else ("PASS" if all(judged) else "FAIL")
@@ -120,14 +120,16 @@ def list_sessions(output_dir: Path) -> List[Dict]:
 KEY_METRICS = {
     # v2
     "R0": ["noise_std_N", "axis_offset_N", "drift_N_per_min"],
-    "R1": ["slope", "nonlin_pct_fs", "hysteresis_pct_fs", "repeatability_pct_fs", "creep_pct_30s",
-           "direction_deg", "crosstalk_Fx_mag_pct", "alignment_ratio"],
-    "R2": ["position_spread_pct", "direction_deg", "alignment_ratio"],
-    "R3": ["direction_spread_pct", "dominant_ratio", "direction_deg"],
+    "R1": ["error_mean_N", "error_max_N", "repeat_std_N", "zero_residual_N", "recovery_s", "rise_ms", "fall_ms",
+           "alignment_ratio"],
+    "R2": ["error_max_N", "site_diff_N", "alignment_ratio"],
+    "R3": ["error_max_N", "site_diff_N", "alignment_ratio"],
+    "R4": ["session_std_N", "session_range_N", "n_sessions"],
     "RM1": ["rate_hz", "drop_pct", "jitter_ms"],
-    "RM2": ["slope", "slope_diff_pct", "delta_half_pct_fs", "max_channel_crosstalk_N"],
-    "RM3": ["delta_half_pct_fs", "static_ratio", "static_std_N"],
+    "RM2": ["multi_diff_N", "error_max_N", "max_channel_crosstalk_N"],
+    "RM3": ["multi_diff_N", "static_ratio", "static_std_N"],
     "RM4": ["drift_N_per_min", "gaps_1s", "drop_pct"],
+    "RM5": ["error_max_N", "error_mean_N", "plate_share_max_pct"],
     # v1
     "S1": ["noise_std_N", "drift_N", "zero_mean_N"],
     "S2": ["slope", "nonlin_pct_fs", "hysteresis_pct_fs", "repeatability_pct_fs", "max_error_pct_fs"],
@@ -138,19 +140,112 @@ KEY_METRICS = {
     "M2": ["slope", "slope_diff_pct", "offset_diff_N", "nonlin_pct_fs"], "M3": ["max_channel_crosstalk_N"],
     "M6": ["drift_N_per_min", "gaps_1s", "drop_pct"], "M7": ["rate_hz", "drop_pct"],
 }
+# 구간마다 여러 값이 나오는 지표는 가장 나쁜 값(|최대|)으로 요약한다. 나머지는 첫 값
+WORST_OF = {"error_max_N", "site_diff_N", "multi_diff_N", "recovery_s", "zero_residual_N",
+            "max_channel_crosstalk_N", "static_ratio", "static_std_N", "repeat_std_N"}
+
+
+def _summarize_metrics(m: pd.DataFrame) -> pd.DataFrame:
+    m = m[m["value"].notna()].copy()
+    m["_abs"] = pd.to_numeric(m["value"], errors="coerce").abs()
+    worst = m[m["name"].isin(WORST_OF)].sort_values("_abs", ascending=False)
+    first = m[~m["name"].isin(WORST_OF)]
+    out = pd.concat([worst, first]).drop_duplicates(["sensor", "name"], keep="first")
+    return out.drop(columns="_abs")
+
+
+def _latest(output_dir: Path, test: str, mode: Optional[str]) -> Dict[str, Dict]:
+    """테스트별로 센서마다 최신(중단 아닌) 세션."""
+    out: Dict[str, Dict] = {}
+    for s in list_sessions(output_dir):          # 최신부터
+        if s["test"] != test or s["status"] == "aborted" or (mode and s["mode"] != mode):
+            continue
+        for sid in s["sensors"].split(","):
+            out.setdefault(sid, s)
+    return out
+
+
+def _headline(output_dir: Path, cfg: Config, mode: Optional[str], out_dir: Path, stamp: str) -> List[str]:
+    """비교 리포트 첫머리: 센서 8개의 힘별 오차, 오차 분포, 영점 복귀·응답 시간 (R1, 정점)."""
+    latest = _latest(output_dir, "R1", mode)
+    latest_r4 = _latest(output_dir, "R4", mode)
+    order = [s.id for s in cfg.sensors]
+    tabs, mets, used = {}, {}, {}
+    for sid in order:
+        s = latest.get(sid)
+        if not s:
+            continue
+        f = s["dir"] / "presses.csv"
+        if f.exists():
+            t = pd.read_csv(f)
+            t = t[t["sensor"] == sid]
+            if len(t):
+                tabs[sid] = t
+                used[sid] = s["id"]
+        if (s["dir"] / "metrics.csv").exists():
+            m = _summarize_metrics(pd.read_csv(s["dir"] / "metrics.csv"))
+            mets[sid] = m[m["sensor"] == sid].set_index("name")["value"]
+    if not tabs:
+        return ["<div class='card'>R1 (정점) 누름 결과가 있는 세션이 없습니다.</div>"]
+    crit = cfg.section("criteria")
+    parts = ["<h2>힘별 오차 (R1 · 정점)</h2>"]
+    types = {s.id: s for s in cfg.sensors}
+    panels = []
+    for t in sorted({types[sid].type for sid in tabs}):
+        ids =[sid for sid in order if sid in tabs and types[sid].type == t]
+        rated = types[ids[0]].rated_N
+        panels.append((f"Type {t} (rated {rated:g} N)", [(sid, P.color_for(sid, order), tabs[sid]) for sid in ids]))
+    name = P.error_by_type(out_dir / f"compare_{stamp}_error.png", panels, "Error per press, by sensor type",
+                           crit.get("error_max_N"))
+    parts.append(f"<figure><img src='{name}' alt='힘별 오차'><figcaption>점 = 누름 1회, 선 = 세기 단계별 평균, "
+                 f"세로 막대 = 단계 안 최소~최대. 빨간 점선 = 판정 기준 ±{crit.get('error_max_N', 1.0):g} N</figcaption></figure>")
+    ids = sorted((sid for sid in order if sid in tabs), key=lambda x: (types[x].type, order.index(x)))
+    name = P.error_box(out_dir / f"compare_{stamp}_box.png", ids, [tabs[s]["error_N"].to_numpy() for s in ids],
+                       [P.color_for(s, order) for s in ids], "Error distribution per sensor (all presses)",
+                       crit.get("error_max_N"))
+    parts.append(f"<figure><img src='{name}' alt='센서별 오차 분포'><figcaption>센서마다 누름 전체의 오차 분포. "
+                 "상자 = 25~75 %, 수염 = 최소~최대, 가운데 선 = 중앙값</figcaption></figure>")
+    rows = []
+    for sid in ids:
+        m = mets.get(sid, pd.Series(dtype=float))
+        r4 = latest_r4.get(sid)
+        m4 = (_summarize_metrics(pd.read_csv(r4["dir"] / "metrics.csv")).query("sensor == @sid")
+              .set_index("name")["value"] if r4 and (r4["dir"] / "metrics.csv").exists() else pd.Series(dtype=float))
+        t = tabs[sid]
+        rows.append({"센서": sid, "타입": types[sid].type, "누름 수": len(t),
+                     "평균 오차 N": float(t["error_N"].mean()), "최대 |오차| N": float(t["error_N"].abs().max()),
+                     "반복 산포 N": m.get("repeat_std_N", np.nan),
+                     "세션 간 산포 N": m4.get("session_std_N", np.nan), "뗀 뒤 잔류 N": m.get("zero_residual_N", np.nan),
+                     "영점 복귀 s": m.get("recovery_s", np.nan), "상승 ms": m.get("rise_ms", np.nan),
+                     "하강 ms": m.get("fall_ms", np.nan), "세션": used[sid]})
+    parts.append(f"<div class='card'>{df_table(pd.DataFrame(rows).set_index('센서'), index=True)}</div>")
+    keys = [("zero_residual_N", "Residual after release (N)", crit.get("zero_residual_N")),
+            ("recovery_s", "Zero recovery time (s)", crit.get("zero_recovery_s")),
+            ("rise_ms", "Rise time 10-90 % (ms)", None), ("fall_ms", "Fall time 90-10 % (ms)", None)]
+    fig, axes = P.new_fig(13, 3.2, 1, 4)
+    for ax, (k, title, lim) in zip(axes[0], keys):
+        vals = [float(mets.get(s, pd.Series(dtype=float)).get(k, np.nan)) for s in ids]
+        ax.bar(ids, vals, 0.6, color=[P.color_for(s, order) for s in ids])
+        if lim:
+            ax.axhline(lim, color=P.CRITICAL, lw=1, ls="--")
+        ax.set_title(title)
+        ax.tick_params(axis="x", labelrotation=45)
+    name = P.save(fig, out_dir / f"compare_{stamp}_recovery_response.png")
+    parts.append(f"<figure><img src='{name}' alt='영점 복귀와 응답 시간'><figcaption>영점 복귀(뗀 뒤 잔류·복귀 시간, "
+                 "빨간 점선 = 기준)와 응답 시간(빠른 입력, 센서 신호만으로 측정)</figcaption></figure>")
+    return parts
 
 
 def compare_report(output_dir: Path, cfg: Config, mode: Optional[str] = None) -> Path:
-    """센서 8개 비교: 테스트마다 센서별 최신 세션의 핵심 지표. mode 가 있으면 그 모드 세션만 (sim/실장비 분리)."""
+    """센서 비교: 첫머리에 R1 힘별 오차·분포·영점 복귀·응답, 이어서 테스트마다 센서별 최신 세션의 핵심 지표.
+    mode 가 있으면 그 모드 세션만 (sim/실장비 분리)."""
     output_dir = Path(output_dir)
     rows = []
     for s in list_sessions(output_dir):
         f = s["dir"] / "metrics.csv"
         if not f.exists() or s["status"] == "aborted" or (mode and s["mode"] != mode):
             continue
-        m = pd.read_csv(f)
-        # 같은 지표 이름이 여러 번 있으면(보조 지표) 첫 번째만
-        m = m.drop_duplicates(["sensor", "name"], keep="first")
+        m = _summarize_metrics(pd.read_csv(f))
         for r in m.itertuples():
             rows.append({"test": s["test"], "session": s["id"], "start": s["start"], "sensor": r.sensor,
                          "name": r.name, "value": r.value, "overall": s["overall"]})
@@ -164,10 +259,10 @@ def compare_report(output_dir: Path, cfg: Config, mode: Optional[str] = None) ->
     parts = [f"<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' "
              f"content='width=device-width,initial-scale=1'><title>센서 비교 리포트</title><style>{CSS}</style></head>"
              f"<body><main><h1>센서 비교 리포트</h1><p class='sub'>{time.strftime('%Y-%m-%d %H:%M')} · 테스트마다 센서별 "
-             f"최신 세션 기준 · {'가상 장비' if mode == 'sim' else '실장비' if mode else '전체'} 세션 · 색 = 센서 타입</p>"]
-    if not rows:
-        parts.append("<div class='card'>분석된 세션이 없습니다.</div>")
-    else:
+             f"최신 세션 기준 · {'가상 장비' if mode == 'sim' else '실장비' if mode else '전체'} 세션 · 오차 단위 N</p>"]
+    parts += _headline(output_dir, cfg, mode, out_dir, stamp)
+    if rows:
+        parts.append("<h1>테스트별 핵심 지표</h1>")
         df = pd.DataFrame(rows)
         # 테스트·센서별 최신 세션만
         latest = df.sort_values("session").groupby(["test", "sensor"])["session"].last().reset_index()
@@ -196,15 +291,15 @@ def compare_report(output_dir: Path, cfg: Config, mode: Optional[str] = None) ->
                 for ax, k in zip(axes[0], keys):
                     vals = piv[k].to_numpy(dtype=float)
                     ax.bar(sensors, vals, 0.6, color=[type_color.get(types.get(s), P.SERIES[0]) for s in sensors])
-                    ax.set_title(LABELS.get(k, (k, ""))[0])
-                    ax.set_ylabel(LABELS.get(k, ("", ""))[1])
+                    ax.set_title(LABELS_EN.get(k, (k, ""))[0])
+                    ax.set_ylabel(LABELS_EN.get(k, ("", ""))[1])
                     ax.axhline(0, color=P.AXIS, lw=0.8)
                 handles = [P.matplotlib.patches.Patch(color=type_color[t], label=f"Type {t}") for t in type_names]
                 fig.legend(handles=handles, loc="upper right", ncol=len(handles))
                 fig.tight_layout(rect=(0, 0, 1, 0.9))
                 name = P.save(fig, out_dir / f"compare_{stamp}_{test}.png", layout=False)
                 parts.append(f"<figure><img src='{name}' alt='{test} 센서 비교'><figcaption>{test} 핵심 지표, "
-                             f"센서별</figcaption></figure>")
+                             f"센서별 (색 = 센서 타입)</figcaption></figure>")
     parts.append("</main></body></html>")
     path.write_text("".join(parts), encoding="utf-8")
     return path

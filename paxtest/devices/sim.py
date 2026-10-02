@@ -31,7 +31,7 @@ R_CONTACT = 0.012                                # 접촉점 반지름 (m) — �
 # ── 기하 ──────────────────────────────────────────────────────────
 def site_normal(site: str, tilt_deg: float = 25.0) -> np.ndarray:
     """접촉점의 표면 법선 (센서 좌표계)."""
-    if not site or site == "pos:apex":
+    if not site or site == "pos:apex" or ":" not in site:     # "plate" 등 → 정점처럼 수직
         return np.array([0.0, 0.0, 1.0])
     kind, _, name = site.partition(":")
     sign = -1.0 if name.startswith("-") else 1.0
@@ -356,32 +356,22 @@ class _Move:
         return self.ramp_s + self.hold_s
 
 
-def build_program(cov: Dict, fs: float, p: Dict, rng: np.random.Generator) -> List[_Move]:
-    """커버리지 목표를 만족하도록 자유 스윕 하중 프로그램을 짠다 (조작자 역할)."""
+def press_program(targets: Sequence[float], p: Dict, rng: np.random.Generator) -> List[_Move]:
+    """누름 블록 행동강령: 안내 세기 근처로 누름 → 유지 → 떼기 → 쉬기 (사람처럼 세기는 ±10 %)."""
+    q = min(1.0, p.get("quick", 1.0) * 3)
     mv: List[_Move] = []
-    edge = float(p["ramp_min_edge_s"]) * 2.0    # smoothstep 의 10→90 % 는 전체의 약 60 %
-    rest = 3.2          # 해제 후 무하중 간격 (영점 복귀 관찰용, 계획서의 "3초 이상"에 맞춤)
-    for _ in range(int(cov.get("ramp", 0))):
-        mv += [_Move(0.92 * fs, edge, 0.4), _Move(0.0, edge, rest)]
-    nb = int(cov.get("bins", 0))
-    if nb:
-        bin_s = float(cov.get("bin_s", 1.0)) * 1.5
-        step = max(1, 10 // max(1, nb))
-        for k in range(nb):                       # 빈 구간 채우기 계단
-            lv = (0.5 + (k * step) % 10) / 10 * fs
-            mv.append(_Move(min(lv, 0.95 * fs), 0.7, bin_s))
-        mv.append(_Move(0.0, 0.7, 0.5))
-    for _ in range(int(cov.get("pulse", 0))):
-        amp = (0.2 + 0.5 * rng.random()) * fs
-        d = float(p["pulse_max_s"]) * 0.35
-        mv += [_Move(amp, d, d * 0.6), _Move(0.0, d, d * 0.8)]
-    for _ in range(int(cov.get("hold", 0))):
-        mv += [_Move(0.5 * fs, 1.2, float(p["hold_min_plateau_s"]) * 1.35),
-               _Move(0.0, float(p["step_max_rise_s"]) * 0.4, rest)]
-    for _ in range(int(cov.get("step", 0))):
-        rise = float(p["step_max_rise_s"]) * 0.3
-        mv += [_Move(0.4 * fs, rise, max(0.8, 3.0 * min(1.0, p.get("quick", 1.0) * 3))),
-               _Move(0.0, rise, rest)]
+    for tgt in targets:
+        f = float(tgt) * (1 + rng.normal(0, 0.05))
+        mv += [_Move(f, max(0.3, 1.2 * q), p["hold_s"] + max(0.6, 1.2 * q)),
+               _Move(0.0, max(0.1, 0.3 * q), p["rest_s"] + max(0.4, 0.8 * q))]
+    return mv
+
+
+def fast_program(fs: float, releases: int, cycle_s: float) -> List[_Move]:
+    """빠른 입력 ②: 절반쯤 눌렀다가 한 번에 떼기. cycle_s = 한 번에 쓰는 시간."""
+    mv: List[_Move] = []
+    for _ in range(releases):
+        mv += [_Move(0.5 * fs, 0.2 * cycle_s, 0.3 * cycle_s), _Move(0.0, 0.01, 0.5 * cycle_s)]
     return mv
 
 
@@ -409,15 +399,15 @@ class SimOperator:
         return max(0.25, self.base_ramp * min(1.0, self.quick * 3))
 
     @property
-    def detect(self) -> Dict:
-        """분석과 같은 임계값 (시간 배율 반영) — 프로그램이 항상 분류되도록."""
-        from ..analysis import contacts as C
-        return C.params(self.proc_v2, self.quick)
+    def press_params(self) -> Dict:
+        """분석·라이브 판정과 같은 값 (시간 배율 반영) — 프로그램이 항상 1회로 세어지도록."""
+        from ..analysis import presses as PR
+        return PR.params(self.proc_v2, self.quick)
 
     def ready_delay(self, step) -> float:
         if step.kind == "instruction":
             return 0.4
-        if step.kind == "free":
+        if step.kind == "press":
             return 0.6
         if step.action in ("load", "zero"):
             return self.ramp + 0.4
@@ -431,6 +421,7 @@ class SimOperator:
         sids = step.sensors or dut_ids
         site = step.tags.get("site")
         by_hand = bool(site and site.startswith("pos:") and site != "pos:apex")
+        self._prog, self._pi, self._done = [], -1, True
         for sid in sids:
             self.world.set_position(sid, step.tags.get("position", "중앙"))
             if site:
@@ -442,9 +433,6 @@ class SimOperator:
                 self.world.set_site(sid, "pos:apex")
             fs = min(self.world.sensors[s].rated_N for s in self._static) if self._static else 10
             self.world.set_static(self._static, 0.15 * fs, self.ramp)
-        if step.kind == "free":
-            self._prog, self._pi, self._done = [], -1, False
-            return
         if step.action == "load":
             others = [s for s in self.world.loads if s not in sids and s not in self._static]
             if others:
@@ -453,26 +441,34 @@ class SimOperator:
         elif step.action == "zero":
             self.world.set_load([s for s in self.world.loads if s not in self._static], 0.0, self.ramp)
 
+    def _start(self, prog: List[_Move], t0: float) -> None:
+        self._prog, self._pi, self._t_next, self._done = prog, -1, t0, False
+
     def on_measure(self, step, dut_ids: List[str]) -> None:
         sids = step.sensors or dut_ids
         now = time.time()
-        if step.kind == "free":
-            fs = min(self.world.sensors[s].rated_N for s in sids)
-            self._prog = build_program(step.tags.get("coverage") or {}, fs, self.detect, self.rng)
-            self._pi, self._t_next, self._done = -1, now, False
+        fs = min(self.world.sensors[s].rated_N for s in sids)
+        if step.kind == "press":
+            self._start(press_program(step.tags.get("targets") or [], self.press_params, self.rng), now)
             return
         if step.action == "tap":
-            fs = min(self.world.sensors[s].rated_N for s in sids)
             for k in range(3):        # 싱크 탭 3회
                 self.world.add_pulse(sids, now + 0.5 + k * 1.0, 0.18, 0.3 * fs)
+        elif step.action == "fast":   # 단계 길이 안에 ① 톡 (30 %) → ② 한 번에 떼기 (60 %)
+            avail = max(3.0, step.duration_s - 1.5)
+            taps, rel = int(step.tags.get("taps", 5)), int(step.tags.get("releases", 5))
+            gap = 0.3 * avail / max(1, taps)
+            for k in range(taps):     # 딱딱한 물체로 톡: 수십 ms
+                self.world.add_pulse(sids, now + 0.5 + k * gap, 0.04, (0.3 + 0.2 * self.rng.random()) * fs)
+            self._start(fast_program(fs, rel, 0.6 * avail / max(1, rel)), now + 0.5 + taps * gap)
         elif step.action == "step":
             self.world.set_load(sids, step.target_N or 0.0, 0.03, t0=now + 0.5)
         elif step.action == "release":
             self.world.set_load(sids, 0.0, 0.08, t0=now + 0.5)
 
     def update(self, step, phase: str, dut_ids: List[str]) -> None:
-        """자유 구간에서 프로그램을 한 스텝씩 진행시킨다."""
-        if step is None or step.kind != "free" or phase != "measure" or self._done:
+        """누름 블록·빠른 입력의 하중 프로그램을 한 동작씩 진행시킨다."""
+        if step is None or phase != "measure" or self._done:
             return
         now = time.time()
         if now < self._t_next:

@@ -1,9 +1,10 @@
-"""v2 테스트(R0~R3, RM1~RM4)의 지표 계산과 판정 — test-plan-v2.md §7.
+"""v2 테스트(R0~R4, RM1~RM4)의 지표 계산과 판정 — test-plan-v2.md §7.
 
-v1 (metrics.py) 과의 차이
-- 비교 기준이 Fz 가 아니라 합력 |F| 이다 (곡면 접촉에서 좌표계와 무관한 유일한 양).
-- 단계별 목표값이 없다. 접촉 이벤트를 자동으로 잘라 분류하고 구간(bin)으로 집계한다.
-- 반복성은 '같은 값 재현' 이 아니라 '같은 구간에 들어온 서로 다른 접촉의 잔차 산포' 다.
+모든 측정은 누름 블록(누르고 유지 → 떼고 쉬기)에서 나온다.
+- 누름 1회 = 점 1개: 안정 유지 창의 게이지 평균 vs 센서 합력 |F| 평균. 오차 = |F| − 게이지 (N).
+- 영점 복귀: 뗀 뒤 쉬는 창에서 센서 힘 벡터가 누르기 전 값으로 돌아오는지 (센서만 사용).
+- 응답 시간: 빠른 입력 블록에서 센서 신호의 상승·하강 10→90 % (센서만 사용, 게이지와 비교하지 않음).
+결과 그래프는 이 세 가지만 만들고, 나머지(전체 기록·동기·무하중)는 진단용으로 뒤에 붙인다.
 """
 from __future__ import annotations
 
@@ -14,34 +15,57 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from . import bins as B
-from . import contacts as C
 from . import plots as P
+from . import presses as PR
 from .loader import SessionData
-from .metrics import LABELS, Result, _colors
+from .metrics import LABELS, LABELS_EN, Result, _colors
 
 V2_LABELS = {
-    "slope": ("기울기 a (|F| = a·G + b)", ""), "intercept": ("절편 b", "N"),
-    "span_pct_fs": ("사용한 하중 범위", "% F.S."), "n_events": ("접촉 이벤트 수", "회"),
-    "creep_pct_30s": ("크리프", "% / 30 s"), "direction_deg": ("방향 안정성 (95 %)", "°"),
-    "alignment_ratio": ("정렬 진단 |F|/게이지", ""), "fmag_zero_N": ("무하중 |F| 평균", "N"),
-    "axis_offset_N": ("무하중 축 오프셋 (최대)", "N"), "fz_ratio": ("Fz / |F| (정점)", ""),
-    "dominant_ratio": ("지배 축 성분 비율", ""), "direction_spread_pct": ("방향 간 기울기 편차", "%"),
+    "n_presses": ("유효 누름 수", "회"), "error_mean_N": ("평균 오차 (|F| − 게이지)", "N"),
+    "error_max_N": ("최대 |오차|", "N"), "repeat_std_N": ("반복 산포 (같은 세기 1σ, 최대)", "N"),
+    "slope": ("기울기 a (|F| = a·G + b, 참고)", ""), "intercept": ("절편 b (참고)", "N"),
+    "zero_residual_N": ("뗀 뒤 잔류 |ΔF| (최대)", "N"), "recovery_s": ("영점 복귀 시간 (최대)", "s"),
+    "rise_ms": ("상승 시간 10→90 % (중앙값)", "ms"), "fall_ms": ("하강 시간 90→10 % (중앙값)", "ms"),
+    "rise_min_ms": ("상승 시간 (최소)", "ms"), "fall_min_ms": ("하강 시간 (최소)", "ms"),
+    "alignment_ratio": ("정렬 진단 |F|/게이지 (중앙값)", ""), "tilt_deg": ("평균 힘 방향 (z 에서)", "°"),
+    "crosstalk_Fx_mag_pct": ("정점 Fx/|F| (참고)", "%"), "crosstalk_Fy_mag_pct": ("정점 Fy/|F| (참고)", "%"),
+    "site_diff_N": ("기준 대비 오차 차이 (최대)", "N"), "multi_diff_N": ("단일(R1) 대비 오차 차이", "N"),
     "static_ratio": ("정하중 채널 흔들림 / 자체 노이즈", ""), "static_std_N": ("정하중 채널 1σ", "N"),
-    "torque_Tx_cv_pct": ("Tx/|F| 변동계수", "%"), "torque_Ty_cv_pct": ("Ty/|F| 변동계수", "%"),
-    "torque_Tx_ratio": ("Tx / |F|", "mN·m/N"), "torque_Ty_ratio": ("Ty / |F|", "mN·m/N"),
-    "coverage_pct": ("커버리지 달성", "%"), "low_force_valid_N": ("저하중 판정 가능 하한", "N"),
-    "slope_diff_pct": ("단일(R1) 대비 기울기 차이", "%"), "offset_diff_N": ("단일(R1) 대비 절편 차이", "N"),
-    "delta_half_pct_fs": ("50 % F.S. 에서 읽음 차이", "% F.S."),
-    "tilt_deg": ("평균 힘 방향 (z 에서)", "°"),
-    "crosstalk_Fx_mag_pct": ("크로스토크 Fx/|F| (정점)", "%"), "crosstalk_Fy_mag_pct": ("크로스토크 Fy/|F| (정점)", "%"),
+    "fmag_zero_N": ("무하중 |F| 평균", "N"), "axis_offset_N": ("무하중 축 오프셋 (최대)", "N"),
+    "n_sessions": ("비교한 세션 수 (R1·R4)", "개"), "session_std_N": ("세션 간 산포 (같은 힘 1σ, 최대)", "N"),
+    "session_range_N": ("세션 간 범위 (같은 힘 최대−최소)", "N"),
 }
 LABELS.update(V2_LABELS)
+V2_LABELS_EN = {
+    "n_presses": ("Valid presses", "count"), "error_mean_N": ("Mean error (|F| - gauge)", "N"),
+    "error_max_N": ("Max |error|", "N"), "repeat_std_N": ("Repeat spread (1σ, worst level)", "N"),
+    "slope": ("Slope a (info)", ""), "intercept": ("Intercept b (info)", "N"),
+    "zero_residual_N": ("Residual after release (max)", "N"), "recovery_s": ("Zero recovery time (max)", "s"),
+    "rise_ms": ("Rise time 10-90 % (median)", "ms"), "fall_ms": ("Fall time 90-10 % (median)", "ms"),
+    "rise_min_ms": ("Rise time (min)", "ms"), "fall_min_ms": ("Fall time (min)", "ms"),
+    "alignment_ratio": ("Alignment |F|/gauge", ""), "tilt_deg": ("Mean force direction (from z)", "°"),
+    "crosstalk_Fx_mag_pct": ("Apex Fx/|F|", "%"), "crosstalk_Fy_mag_pct": ("Apex Fy/|F|", "%"),
+    "site_diff_N": ("Error diff vs. reference (max)", "N"), "multi_diff_N": ("Error diff vs. single (R1)", "N"),
+    "static_ratio": ("Static channel jitter / own noise", ""), "static_std_N": ("Static channel 1σ", "N"),
+    "fmag_zero_N": ("Zero-load |F| mean", "N"), "axis_offset_N": ("Zero-load axis offset (max)", "N"),
+    "n_sessions": ("Sessions compared (R1/R4)", "count"), "session_std_N": ("Between-session spread (1σ, worst)", "N"),
+    "session_range_N": ("Between-session range (worst)", "N"),
+}
+LABELS_EN.update(V2_LABELS_EN)
+
+PRESS_COLS = ["sensor", "label", "site", "group", "n", "level_N", "gauge_N", "Fmag", "error_N", "Fx", "Fy", "Fz",
+              "sensor_std_N", "t0", "t1", "c0", "c1", "rest_s"]
+
+
+def empty_presses() -> pd.DataFrame:
+    """누름 0회 블록의 빈 표. 숫자 열을 float 로 둬야 다른 블록과 합쳐도 object 로 바뀌지 않는다."""
+    return pd.DataFrame({c: pd.Series(dtype=object if c in ("sensor", "label", "site", "group") else float)
+                         for c in PRESS_COLS})
 
 
 # ── 공통 ──────────────────────────────────────────────────────────
-def _p(sd: SessionData) -> Dict:
-    return C.params(sd.proc_v2, sd.quick)
+def _pp(sd: SessionData) -> Dict:
+    return PR.params(sd.proc_v2, sd.quick)
 
 
 def _tags(e) -> Dict:
@@ -49,18 +73,18 @@ def _tags(e) -> Dict:
     return t if isinstance(t, dict) else {}
 
 
-def _segments(sd: SessionData) -> List[Dict]:
-    """자유 스윕 구간 목록."""
-    segs = []
+def _blocks(sd: SessionData) -> List[Dict]:
+    """누름 블록 목록."""
+    out = []
     for _, e in sd.segments.iterrows():
         tg = _tags(e)
         sids = list(e["sensors"]) or sd.sensor_ids[:1]
-        segs.append({"step_idx": int(e["step_idx"]), "title": e["title"], "t0": float(e["t_start"]),
-                     "t1": float(e["t_end"]), "sensor": tg.get("swept") or sids[0],
-                     "label": tg.get("label") or e["title"], "site": tg.get("site", ""),
-                     "group": tg.get("group", ""), "static": tg.get("static") or [],
-                     "coverage": tg.get("coverage") or {}})
-    return segs
+        out.append({"step_idx": int(e["step_idx"]), "title": e["title"], "t0": float(e["t_start"]),
+                    "t1": float(e["t_end"]), "sensor": tg.get("swept") or sids[0],
+                    "label": tg.get("label") or e["title"], "site": tg.get("site", ""),
+                    "group": tg.get("group", ""), "static": tg.get("static") or [],
+                    "levels_N": tg.get("levels_N") or [], "targets": tg.get("targets") or []})
+    return out
 
 
 SETTLE_S = 10.0          # 무하중 구간 앞쪽에서 버리는 정착 시간
@@ -89,17 +113,6 @@ def _gauge(sd: SessionData, a: float, b: float):
     return sd.gauge.loc[m, "t"].to_numpy(), sd.gauge.loc[m, "F"].to_numpy()
 
 
-def _low_force_limit(sd: SessionData) -> float:
-    g = sd.meta.get("config", {}).get("gauge", {}) or {}
-    v = g.get("low_force_valid_N")
-    return float(v) if v else 4.0 * float(g.get("accuracy_N", 0) or 0)
-
-
-def _delta_at(fit: Dict, ref: Dict, x: float) -> float:
-    """같은 기준 하중에서 두 회귀선이 주는 읽음 차이. 기울기·절편을 하나로 합친 물리량."""
-    return (fit["slope"] * x + fit["intercept"]) - (ref["slope"] * x + ref["intercept"])
-
-
 def _smoothed_peak(t: np.ndarray, y: np.ndarray, win_s: float = 0.5) -> float:
     """0.5초 이동평균의 최대 |변화|. 노이즈 첨두가 아니라 실제로 끌려간 양을 본다."""
     if len(t) < 5:
@@ -112,17 +125,9 @@ def _smoothed_peak(t: np.ndarray, y: np.ndarray, win_s: float = 0.5) -> float:
     return float(np.nanmax(np.abs(sm)))
 
 
-def _cross(t: np.ndarray, y: np.ndarray, level: float) -> float:
-    idx = np.where(y >= level)[0]
-    if not len(idx) or idx[0] == 0:
-        return np.nan
-    i = idx[0]
-    return t[i - 1] + (level - y[i - 1]) * (t[i] - t[i - 1]) / ((y[i] - y[i - 1]) or 1e-9)
-
-
-# ── 영점 · 노이즈 ─────────────────────────────────────────────────
+# ── 영점 · 노이즈 (진단) ──────────────────────────────────────────
 def zero_stats(sd: SessionData, res: Result, crit: Dict, pdir: Path, check: bool = True) -> Dict[str, float]:
-    """무하중 기록 구간에서 영점·노이즈·드리프트 (6축 + |F|)."""
+    """무하중 기록 구간에서 영점·노이즈·드리프트."""
     wins = _zero_wins(sd)
     colors = _colors(sd)
     noise = {}
@@ -169,218 +174,238 @@ def zero_stats(sd: SessionData, res: Result, crit: Dict, pdir: Path, check: bool
                 res.check(sid, "drift_N", slope * (t[-1] - t[0]) / 60, crit["zero_residual_N"])
         items.append((sid, t - t[0], yy, colors[sid], "-"))
     if items:
-        res.plot(P.curves(pdir / "zero.png", items, "무하중 |F| (가장 긴 구간)", "시간 (s)", "|F| (N)",
-                          band=crit["zero_residual_N"]), "회색 띠 = 영점 기준. |F| 는 잡음의 절대값이라 0 보다 약간 큼")
+        res.plot(P.curves(pdir / "zero.png", items, "Zero-load |F| (longest window)", "Time (s)", "|F| (N)",
+                          band=crit["zero_residual_N"]),
+                 "[진단] 무하중 |F|. 회색 띠 = 영점 기준. |F| 는 잡음의 크기라 0 보다 약간 큼")
     return noise
 
 
-# ── 구간 분석 ─────────────────────────────────────────────────────
-def analyze_segment(sd: SessionData, seg: Dict, p: Dict) -> Dict:
-    """한 자유 구간: 병합 → 이벤트 → 회귀 → bin → 부가 지표."""
-    sid = seg["sensor"]
-    fs = sd.fs(sid)
-    df = B.merged_frame(sd, sid, seg["t0"], seg["t1"], p)
-    ev = df.attrs.get("events", pd.DataFrame())
-    fit = B.fit_line(df, fs)
-    bt = B.bin_table(df, fs, p, fit)
-    return {"seg": seg, "sensor": sid, "fs": fs, "df": df, "events": ev, "fit": fit, "bins": bt,
-            "align": B.alignment(df, fs), "dirstat": B.direction_stability(df, fs, ("ramp", "pulse")),
-            "coverage": C.coverage(ev, C.bin_seconds(df["t"].to_numpy(), df["G"].to_numpy(), fs, p)
-                                   if len(df) else np.zeros(C.n_bins(p)), seg["coverage"])}
+# ── 누름 블록 ─────────────────────────────────────────────────────
+def block_presses(sd: SessionData, blk: Dict, p: Dict) -> pd.DataFrame:
+    sid = blk["sensor"]
+    tg, g = _gauge(sd, blk["t0"], blk["t1"])
+    found = PR.find_presses(tg, g, p)
+    px = sd.sensor_df(sid)
+    px = px[(px["t"] >= blk["t0"] - 3) & (px["t"] <= blk["t1"] + 3)]
+    tab = PR.press_table(found, tg, g, px, p)
+    if tab.empty:
+        return empty_presses()
+    tab["level_N"] = PR.assign_levels(tab, blk["levels_N"])
+    for k in ("c0", "c1", "rest_s"):
+        tab[k] = found[k].to_numpy()
+    tab["sensor"], tab["label"], tab["site"], tab["group"] = sid, blk["label"], blk["site"], blk["group"]
+    return tab[PRESS_COLS]
 
 
-def coverage_table(rows: List[Dict]) -> pd.DataFrame:
+def level_table(tab: pd.DataFrame) -> pd.DataFrame:
+    """세기 단계별: 누름 수, 게이지 평균, 오차 평균·1σ·최소·최대 (N)."""
+    if tab.empty:
+        return pd.DataFrame()
+    g = tab.groupby("level_N").agg(n=("error_N", "size"), gauge_N=("gauge_N", "mean"),
+                                   err_mean=("error_N", "mean"), err_std=("error_N", "std"),
+                                   err_min=("error_N", "min"), err_max=("error_N", "max")).reset_index()
+    return g
+
+
+def _ref_curve(tab: pd.DataFrame) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    lv = level_table(tab)
+    if len(lv) < 1:
+        return None
+    lv = lv.sort_values("gauge_N")
+    return lv["gauge_N"].to_numpy(), lv["err_mean"].to_numpy()
+
+
+def diff_vs(tab: pd.DataFrame, ref: Optional[Tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+    """같은 힘에서의 오차 차이 = 이 누름의 오차 − 기준 곡선(단계 평균을 이은 선)의 오차."""
+    if ref is None or tab.empty:
+        return np.full(len(tab), np.nan)
+    return tab["error_N"].to_numpy() - np.interp(tab["gauge_N"].to_numpy(), ref[0], ref[1])
+
+
+def report_errors(res: Result, crit: Dict, sid: str, tab: pd.DataFrame, lab: str = "",
+                  checks: bool = True) -> None:
+    """오차 지표 (N): 평균, 최대 |오차|, 같은 세기 반복 산포. 기울기·절편은 보정용 참고값."""
+    suf = f" · {lab}" if lab else ""
+    res.metric(sid, "n_presses", int(len(tab)), label=LABELS["n_presses"][0] + suf)
+    if tab.empty:
+        return
+    err = tab["error_N"].to_numpy(dtype=float)
+    emax = float(np.nanmax(np.abs(err)))
+    res.metric(sid, "error_mean_N", float(np.nanmean(err)), label=LABELS["error_mean_N"][0] + suf)
+    res.metric(sid, "error_max_N", emax, label=LABELS["error_max_N"][0] + suf)
+    lv = level_table(tab)
+    rep = lv.loc[lv["n"] >= 2, "err_std"]
+    rep_v = float(rep.max()) if len(rep) else np.nan
+    res.metric(sid, "repeat_std_N", rep_v, label=LABELS["repeat_std_N"][0] + suf)
+    if len(tab) >= 3 and np.ptp(tab["gauge_N"]) > 1.0:
+        a, b = np.polyfit(tab["gauge_N"], tab["Fmag"], 1)
+        res.metric(sid, "slope", float(a), label=LABELS["slope"][0] + suf)
+        res.metric(sid, "intercept", float(b), label=LABELS["intercept"][0] + suf)
+    ratio = (tab["Fmag"] / tab["gauge_N"]).to_numpy(dtype=float)
+    res.metric(sid, "alignment_ratio", float(np.nanmedian(ratio)), label=LABELS["alignment_ratio"][0] + suf)
+    if checks:
+        res.check(sid, "error_max_N", emax, crit.get("error_max_N", 1.0), label="최대 |오차|" + suf)
+        if np.isfinite(rep_v):
+            res.check(sid, "repeat_std_N", rep_v, crit.get("repeat_std_N", 0.3), label="반복 산포" + suf)
+
+
+def direction_info(res: Result, sid: str, tab: pd.DataFrame, fs: float, lab: str = "") -> Dict:
+    """평균 힘 방향(z 에서 기울어진 각)과 정점 Fx·Fy 비율 — 참고값."""
+    d = tab[tab["Fmag"] > 0.2 * fs]
+    if d.empty:
+        return {}
+    v = d[["Fx", "Fy", "Fz"]].to_numpy(dtype=float)
+    u = v / np.linalg.norm(v, axis=1, keepdims=True)
+    m = u.mean(axis=0)
+    m /= np.linalg.norm(m)
+    tilt = float(np.degrees(np.arccos(np.clip(m[2], -1, 1))))
+    suf = f" · {lab}" if lab else ""
+    res.metric(sid, "tilt_deg", tilt, label=LABELS["tilt_deg"][0] + suf)
+    return {"tilt": tilt, "fx": float(np.median(np.abs(d["Fx"] / d["Fmag"])) * 100),
+            "fy": float(np.median(np.abs(d["Fy"] / d["Fmag"])) * 100)}
+
+
+def alignment_warn(res: Result, crit: Dict, tab: pd.DataFrame) -> None:
+    if tab.empty:
+        return
+    r = (tab["Fmag"] / tab["gauge_N"]).groupby(tab["label"]).median()
+    bad = r[r > crit.get("alignment_ratio_max", 1.05)]
+    if len(bad):
+        res.notes.append("|F|/게이지 가 큰 구간: " + ", ".join(f"{k} {v:.3f}" for k, v in bad.items())
+                         + ". 팁이 법선에서 벗어나 측력(마찰)이 섞였을 수 있습니다. 이 오차는 센서 탓이 아닐 수 있습니다")
+
+
+def save_presses(sd: SessionData, tab: pd.DataFrame) -> None:
+    tab.assign(test=sd.meta.get("test_code", "")).to_csv(sd.dir / "presses.csv", index=False, encoding="utf-8-sig")
+
+
+def _ref_presses(sd: SessionData, sid: str, codes=("R1",), site: str = "pos:apex") -> Tuple[pd.DataFrame, str]:
+    """같은 센서의 최신 단일 센서 세션(같은 모드)에서 누름 표."""
+    for code in codes:
+        for d in sorted(sd.dir.parent.glob(f"*_{code}_{sid}"), reverse=True):
+            if d == sd.dir or not (d / "presses.csv").exists():
+                continue
+            try:
+                if json.loads((d / "meta.json").read_text(encoding="utf-8")).get("mode") != sd.meta.get("mode"):
+                    continue
+            except Exception:
+                continue
+            t = pd.read_csv(d / "presses.csv")
+            t = t[(t["sensor"] == sid) & (t["site"] == site)]
+            if len(t):
+                return t, d.name
+    return pd.DataFrame(), ""
+
+
+# ── 영점 복귀 ─────────────────────────────────────────────────────
+def recovery_all(sd: SessionData, sid: str, tab: pd.DataFrame, p: Dict, crit: Dict) -> List[Dict]:
+    """누름마다 뗀 뒤 쉬는 창에서 영점 복귀."""
     out = []
-    for r in rows:
-        cov = r["coverage"]
-        cnt = cov.get("counts", {})
-        done = "✓" if cov.get("done") else "부족"
-        out.append({"구간": r["seg"]["label"], "램프": cnt.get("ramp", 0), "펄스": cnt.get("pulse", 0),
-                    "홀드": cnt.get("hold", 0), "스텝": cnt.get("step", 0), "기타": cnt.get("other", 0),
-                    "채운 구간": sum(1 for s in cov.get("bin_s", []) if s >= cov.get("bin_min_s", 1.0)
-                                  or s >= float(r["seg"]["coverage"].get("bin_s", 1.0))),
-                    "목표 충족": done})
-    return pd.DataFrame(out)
-
-
-def report_fit(res: Result, crit: Dict, r: Dict, *, prefix: str = "", checks: bool = True) -> None:
-    sid, fs, fit, bt = r["sensor"], r["fs"], r["fit"], r["bins"]
-    lab = f"{prefix}" if prefix else ""
-    if not fit:
-        res.notes.append(f"{sid} {lab}: 회귀에 필요한 준정적 데이터가 부족합니다 (더 천천히 누르세요)")
-        return
-    for k in ("slope", "intercept", "r2", "span_pct_fs"):
-        res.metric(sid, k, fit[k], label=(LABELS[k][0] + (f" · {lab}" if lab else "")))
-    nl = B.nonlinearity_pct_fs(bt, fs)
-    mx = B.max_error_pct_fs(bt, fs)
-    res.metric(sid, "nonlin_pct_fs", nl, label="비선형성" + (f" · {lab}" if lab else ""))
-    res.metric(sid, "max_error_pct_fs", mx, label="최대 오차" + (f" · {lab}" if lab else ""))
-    if not checks:
-        return
-    res.check(sid, "slope", abs(fit["slope"] - 1), crit.get("slope_tol", 0.03), label="기울기 |a − 1|")
-    if np.isfinite(nl):
-        res.check(sid, "nonlin_pct_fs", nl, crit["nonlinearity_pct_fs"])
-
-
-# ── 크리프 · 영점 복귀 · 동적 ─────────────────────────────────────
-def creep_recovery(sd: SessionData, r: Dict, res: Result, crit: Dict, pdir: Path) -> None:
-    sid, fs, df, ev = r["sensor"], r["fs"], r["df"], r["events"]
+    px = sd.sensor_df(sid)
     thr = crit["zero_residual_N"]
-    q = max(0.02, min(1.0, sd.quick))
-    norm_s = 30.0 * q            # 리허설(시간 배율)에서는 기준 시간도 함께 줄어든다
-    creeps, resid, recs = [], [], []
-    citems, ritems = [], []
-    holds = ev[ev["kind"] == "hold"] if not ev.empty else pd.DataFrame()
-    for k, h in enumerate(holds.itertuples()):
-        # 상승·하강 전이는 센서·게이지 지연 때문에 크리프처럼 보인다. 플라토 구간만 쓴다
-        a = h.pl_t0 if np.isfinite(getattr(h, "pl_t0", np.nan)) else h.t0
-        b = h.pl_t1 if np.isfinite(getattr(h, "pl_t1", np.nan)) else h.t1
-        d = df[(df["t"] >= a) & (df["t"] <= b) & df["Fmag"].notna()]
-        if len(d) < 30 or b - a < 0.5:
+    for r in tab.itertuples():
+        tg, g = _gauge(sd, r.c0 - 1.3, r.c0 - 0.1)
+        if len(g) and float(np.max(g)) > p["contact_N"]:      # 누르기 전에도 닿아 있었음 → 기준 없음
             continue
-        err = (d["Fmag"] - d["G"]).to_numpy()
-        t = d["t"].to_numpy() - a
-        w = min(3.0, 0.2 * (t[-1] - t[0]))
-        a, b = err[t < t[0] + w], err[t > t[-1] - w]
-        ref = float(np.nanmean(d["Fmag"]))
-        span = max(1e-6, t[-1] - t[0] - w)
-        if ref > 0.1 * fs and len(a) and len(b) and span > 0.3 * norm_s:
-            creeps.append((float(np.nanmean(b) - np.nanmean(a)) / ref * 100) * (norm_s / span))
-            citems.append((f"홀드 {k + 1}", t, err - float(np.nanmean(a)), P.SERIES[k % 8], "-"))
-    # 영점 복귀: 이벤트가 끝난 뒤 다음 접촉 전까지 |F| 가 기준 이내로 돌아오는지
-    need = max(2.0, min(3.0, crit["zero_recovery_s"]))
-    cand = ev[ev["kind"].isin(["ramp", "hold", "step", "pulse"])] if not ev.empty else pd.DataFrame()
-    nexts = list(ev["t0"].iloc[1:]) + [np.inf] if not ev.empty else []
-    gaps = {int(row.event): (nexts[i] if i < len(nexts) else np.inf) for i, row in enumerate(ev.itertuples())} \
-        if not ev.empty else {}
-    skipped = short = 0
-    full = crit["zero_recovery_s"]      # 이 시간 이상 비어 있어야 '복귀 실패' 라고 말할 수 있다
-    for k, e in enumerate(cand.itertuples()):
-        stop = min(gaps.get(int(e.event), np.inf) - 0.2, e.t1 + max(8.0, 3 * full))
-        w = stop - e.t1
-        if w < need:                    # 다음 접촉이 너무 빨라 복귀를 관찰할 수 없음
-            skipped += 1
-            continue
-        t, y = _series(sd, sid, e.t1 - 0.5, stop)
+        rec = PR.recovery(px, r.c0, r.c1, r.c1 + min(r.rest_s, 3 * p["rest_s"]) - 0.2, thr)
+        if rec is not None:
+            rec.update(level=r.gauge_N, n=r.n)
+            out.append(rec)
+    return out
+
+
+def report_recovery(res: Result, crit: Dict, sid: str, recs: List[Dict], p: Dict) -> None:
+    if not recs:
+        res.notes.append(f"{sid}: 영점 복귀를 볼 수 있는 쉬는 구간이 없습니다 (뗀 뒤 손대지 않고 쉬세요)")
+        return
+    resid = [r["residual_N"] for r in recs]
+    times = [r["recovery_s"] for r in recs]
+    worst = float(np.nanmax(resid))
+    res.metric(sid, "zero_residual_N", worst)
+    res.check(sid, "zero_residual_N", worst, crit["zero_residual_N"], label=f"뗀 뒤 {p['rest_s']:g}초 잔류 (최대)")
+    finite = [x for x in times if np.isfinite(x)]
+    res.metric(sid, "recovery_s", float(np.max(finite)) if finite else None)
+    res.check(sid, "recovery_s", float(np.max(times)) if len(finite) == len(times) else float("inf"),
+              crit["zero_recovery_s"])
+    if len(finite) < len(times):
+        res.notes.append(f"{sid}: 누름 {len(times) - len(finite)}회는 쉬는 구간 안에 영점 기준으로 돌아오지 못했습니다")
+
+
+def plot_recovery(pdir: Path, sid: str, recs: List[Dict], thr: float) -> str:
+    cm = P.matplotlib.colormaps["viridis"]
+    lv = [r["level"] for r in recs]
+    lo, hi = min(lv), max(lv)
+    fig, ax = P.new_fig(8, 3.4)
+    ax = ax[0, 0]
+    ax.axhspan(0, thr, color="#f0efec", lw=0, label=f"Limit {thr:g} N")
+    for r in recs:
+        c = cm(0.1 + 0.8 * (r["level"] - lo) / (hi - lo) if hi > lo else 0.5)
+        ax.plot(r["rel"], r["resid"], color=c, lw=1.0)
+    sm = P.matplotlib.cm.ScalarMappable(cmap=cm, norm=P.matplotlib.colors.Normalize(lo, hi))
+    fig.colorbar(sm, ax=ax, label="Press level (N)")
+    ax.set_ylim(0, max(4 * thr, min(1.5, float(np.nanmax([np.nanmax(r["resid"][r["rel"] > 0.3])
+                                                          for r in recs if (r["rel"] > 0.3).any()] or [thr])) * 1.2)))
+    ax.set_xlim(0, None)
+    ax.set_title(f"{sid} · Zero recovery after each release")
+    ax.set_xlabel("Time since release (s)")
+    ax.set_ylabel("|F - F(before press)| (N)")
+    ax.legend(loc="upper right")
+    return P.save(fig, pdir / f"recovery_{sid}.png")
+
+
+# ── 응답 시간 (빠른 입력) ─────────────────────────────────────────
+TAP_MAX_S = 0.3          # 이보다 짧은 접촉 = 톡 (상승 시간용). 긴 접촉은 한 번에 떼기 (하강 시간용)
+
+def response(sd: SessionData, res: Result, pdir: Path, sid: str) -> None:
+    ev = sd.events[(sd.events["action"] == "fast")] if not sd.events.empty else pd.DataFrame()
+    if ev.empty:
+        return
+    fs = sd.fs(sid)
+    rises, falls, items_r, items_f = [], [], [], []
+    for e in ev.itertuples():
+        t, y = _series(sd, sid, e.t_start, e.t_end)
         if len(t) < 20:
             continue
-        rel = t - e.t1
-        after = rel > 0
-        if not after.any():
-            continue
-        over = np.where(after & (y > thr))[0]
-        if not len(over):
-            rec = 0.0
-        elif over[-1] >= len(t) - 3:    # 창 끝까지 기준 위 → 창이 기준 시간보다 짧으면 판정 불가
-            if w < full:
-                short += 1
-                continue
-            rec = np.inf
-        else:
-            rec = float(rel[over[-1]])
-        if w >= full or np.isfinite(rec):
-            tail = y[rel > max(rel[-1] - 2.0, min(full, rel[-1] * 0.6))]
-            if len(tail):
-                resid.append(float(np.nanmean(tail)))
-        recs.append(rec)
-        if len(ritems) < 8:      # 건너뛴 이벤트가 있어도 그려지는 것은 앞에서부터 8개
-            n = len(ritems)
-            ritems.append((f"해제 {n + 1}", rel, y, P.SERIES[n % 8], "-"))
-    if creeps:
-        worst = float(np.nanmax(np.abs(creeps)))
-        res.metric(sid, "creep_pct_30s", worst)
-        res.check(sid, "creep_pct_30s", worst, crit.get("creep_pct_per_30s", 2))
-    elif not holds.empty:
-        res.notes.append(f"{sid}: 홀드 구간은 있으나 크리프를 계산할 만큼 길지 않음")
-    if short:
-        res.notes.append(f"{sid}: 해제 {short}회는 다음 접촉까지 {full:g}초가 안 되어 복귀 판정에서 제외했습니다")
-    if skipped and not recs:
-        res.notes.append(f"{sid}: 접촉 사이 간격이 짧아 영점 복귀를 관찰할 구간이 없습니다 "
-                         f"(해제 후 {full:g}초 이상 비워 두세요)")
-    if resid:
-        w = float(np.nanmax(np.abs(resid)))
-        res.metric(sid, "zero_residual_N", w)
-        res.check(sid, "zero_residual_N", w, thr)
-    if recs:
-        finite = [x for x in recs if np.isfinite(x)]
-        res.metric(sid, "recovery_s", float(np.max(finite)) if finite else None)
-        res.check(sid, "recovery_s", float(np.max(recs)) if np.all(np.isfinite(recs)) else float("inf"),
-                  crit["zero_recovery_s"])
-        if not np.all(np.isfinite(recs)):
-            res.notes.append(f"{sid}: 일부 해제 후 기록 구간 안에 영점 기준으로 복귀하지 못함")
-    if citems or ritems:
-        none_item = [("데이터 없음", np.array([0.0]), np.array([0.0]), P.AXIS, "-")]
-        res.plot(P.two_panel_curves(pdir / f"creep_recovery_{sid}.png",
-                                    {"items": citems or none_item,
-                                     "title": f"{sid} · 홀드 중 (|F| - 게이지) 변화", "xlabel": "유지 시작 후 (s)",
-                                     "ylabel": "Δ오차 (N)", "band": None},
-                                    {"items": ritems or none_item, "title": "해제 후 |F| (영점 복귀)",
-                                     "xlabel": "해제 후 (s)", "ylabel": "|F| (N)", "band": thr,
-                                     "xlim": (-0.5, None) if ritems else None,
-                                     "ylim": (-max(0.3, 2 * thr), max(0.6, 6 * thr)) if ritems else None}),
-                 "왼쪽: 게이지 대비 차이의 드리프트 = 크리프 (손 흔들림은 상쇄) · 오른쪽: 회색 띠 = 영점 기준")
-
-
-def dynamic(sd: SessionData, r: Dict, res: Result, pdir: Path) -> None:
-    sid, ev = r["sensor"], r["events"]
-    steps = ev[ev["kind"] == "step"] if not ev.empty else pd.DataFrame()
-    if steps.empty:
+        found = PR.edges(t, y, max(0.5, 0.03 * fs), max(1.0, 0.1 * fs))
+        for d in found:
+            amp = d["peak_N"]
+            tap = d["dur_s"] < TAP_MAX_S
+            # 상승은 톡(짧은 접촉)에서만, 하강은 누르고 한 번에 뗀 것에서만 — 사람이 천천히 누른 변은 빼고
+            if tap and np.isfinite(d["rise_ms"]):
+                rises.append(d["rise_ms"])
+                w = (t >= d["t_up"] - 0.05) & (t <= d["t_up"] + 0.15)
+                items_r.append(((t[w] - d["t_up"]) * 1000, (y[w] - d["base_N"]) / amp))
+            if not tap and np.isfinite(d["fall_ms"]):
+                falls.append(d["fall_ms"])
+                w = (t >= d["t_down"] - 0.05) & (t <= d["t_down"] + 0.15)
+                items_f.append(((t[w] - d["t_down"]) * 1000, (y[w] - d["base_N"]) / d["level_N"]))
+    if not rises and not falls:
+        res.notes.append(f"{sid}: 빠른 입력 구간에서 상승·하강을 찾지 못했습니다")
         return
-    items, delays, rises, overs, rg = [], [], [], [], []
-    for k, e in enumerate(steps.itertuples()):
-        t, y = _series(sd, sid, e.t0 - 0.3, e.t0 + min(3.0, e.dur_s))
-        tg, g = _gauge(sd, e.t0 - 0.3, e.t0 + min(3.0, e.dur_s))
-        if len(t) < 15 or len(tg) < 5:
-            continue
-        yf, gf = np.nanmean(y[t > t[-1] - 0.6]), np.nanmean(g[tg > tg[-1] - 0.6])
-        y0, g0 = np.nanmean(y[:5]), np.nanmean(g[:3])
-        if not np.isfinite([yf, gf, y0, g0]).all() or gf - g0 < 0.2 or yf - y0 < 0.2:
-            continue
-        yn, gn = (y - y0) / (yf - y0), (g - g0) / (gf - g0)
-        tg50, tp50 = _cross(tg, gn, 0.5), _cross(t, yn, 0.5)
-        delays.append((tp50 - tg50) * 1000)
-        rises.append((_cross(t, yn, 0.9) - _cross(t, yn, 0.1)) * 1000)
-        rg.append((_cross(tg, gn, 0.9) - _cross(tg, gn, 0.1)) * 1000)
-        overs.append((np.nanmax(y) - yf) / (yf - y0) * 100)
-        items.append(("게이지" if k == 0 else "_nolegend_", tg - tg50, gn, P.GAUGE, "--"))
-        items.append(("Paxini |F|" if k == 0 else "_nolegend_", t - tg50, yn, P.SERIES[0], "-"))
-    if not delays:
-        return
-    res.metric(sid, "delay_ms", float(np.nanmean(delays)))
-    res.metric(sid, "rise_ms", float(np.nanmean(rises)))
-    res.metric(sid, "rise_ms", float(np.nanmean(rg)), label="게이지 상승 시간 (참고)")
-    res.metric(sid, "overshoot_pct", float(np.nanmean(overs)))
-    res.notes.append("동적 응답은 게이지 대역폭(약 50 Hz)이 분해능을 제한하므로 참고값입니다")
-    res.plot(P.curves(pdir / f"step_{sid}.png", items, f"{sid} · 스텝 응답 (게이지 50 % 시점 정렬)",
-                      "시간 (s)", "정규화 출력", xlim=(-0.3, 0.7)), "점선 = 게이지, 실선 = Paxini |F|")
-
-
-def alignment_note(res: Result, crit: Dict, rows: List[Dict]) -> None:
-    """정렬 진단: |F|/게이지 가 1 보다 체계적으로 크면 측력(마찰·정렬 불량) 의심."""
-    tab = []
-    for r in rows:
-        a = r["align"]
-        sid = r["sensor"]
-        lab = r["seg"]["label"]
-        res.metric(sid, "alignment_ratio", a["median"], label=f"정렬 |F|/게이지 · {lab}")
-        tab.append({"구간": lab, "센서": sid, "|F|/게이지 중앙값": a["median"], "90 %": a["p90"],
-                    "판정": "정렬 양호" if (np.isfinite(a["median"]) and
-                                        a["median"] <= crit.get("alignment_ratio_max", 1.05)) else "측력 의심"})
-    if tab:
-        res.tables["정렬 진단"] = pd.DataFrame(tab)
-        worst = max((t["|F|/게이지 중앙값"] for t in tab if np.isfinite(t["|F|/게이지 중앙값"])), default=np.nan)
-        if np.isfinite(worst) and worst > crit.get("alignment_ratio_max", 1.05):
-            res.notes.append(f"|F|/게이지 가 최대 {worst:.3f} 로 큽니다. 팁 각도가 법선에서 벗어나 측력이 "
-                             f"섞였을 가능성이 있습니다 (센서 오차와 구분됨)")
-
-
-def low_force_note(sd: SessionData, res: Result, rows: List[Dict]) -> None:
-    lim = _low_force_limit(sd)
-    if lim <= 0:
-        return
-    res.metric(rows[0]["sensor"] if rows else sd.sensor_ids[0], "low_force_valid_N", lim)
-    res.notes.append(f"게이지 정확도상 {lim:.1f} N 미만 구간은 판정 보류입니다. 저하중은 별도 기준기 세션이 "
-                     f"필요합니다 (test-plan-v2.md §3.1)")
+    if rises:
+        res.metric(sid, "rise_ms", float(np.median(rises)))
+        res.metric(sid, "rise_min_ms", float(np.min(rises)))
+    if falls:
+        res.metric(sid, "fall_ms", float(np.median(falls)))
+        res.metric(sid, "fall_min_ms", float(np.min(falls)))
+    dt = float(np.median(np.diff(sd.sensor_df(sid)["t"]))) * 1000
+    res.notes.append(f"{sid}: 응답 시간은 센서 신호만으로 잰 값입니다 (샘플 간격 {dt:.1f} ms). 입력 자체의 속도가 섞이므로 "
+                     "최솟값이 센서 응답 시간의 상한에 가깝습니다. 게이지(약 10 Hz)와는 비교하지 않습니다")
+    fig, axes = P.new_fig(10, 3.3, 1, 2, sharey=True)
+    col = P.SERIES[0]
+    for ax, items, vals, name in ((axes[0, 0], items_r, rises, "Rise"), (axes[0, 1], items_f, falls, "Fall")):
+        for x, yy in items:
+            ax.plot(x, yy, color=col, lw=1.0, alpha=0.6, marker=".", ms=3)
+        for lv in (0.1, 0.9):
+            ax.axhline(lv, color=P.AXIS, lw=0.8, ls=":")
+        txt = f"median {np.median(vals):.0f} ms · min {np.min(vals):.0f} ms · n={len(vals)}" if vals else "no data"
+        kind = "(taps)" if name == "Rise" else "(quick releases)"
+        span = "10-90" if name == "Rise" else "90-10"
+        ax.set_title(f"{sid} · {name} {kind} {span} %\n{txt}")
+        ax.set_xlabel(f"Time from {'10 %' if name == 'Rise' else '90 %'} crossing (ms)")
+    axes[0, 0].set_ylabel("Normalized |F|")
+    res.plot(P.save(fig, pdir / f"response_{sid}.png"),
+             "빠른 입력마다 센서 |F| 를 정규화해 겹친 것 (점 = PXSR 샘플). 왼쪽 = 톡의 상승, 오른쪽 = 누르고 한 번에 뗄 때 하강")
 
 
 # ── 테스트별 ──────────────────────────────────────────────────────
@@ -393,135 +418,185 @@ def a_r0(sd, st, res, crit, pdir):
 
 
 def a_r1(sd, st, res, crit, pdir):
-    p = _p(sd)
-    segs = _segments(sd)
-    if not segs:
-        res.notes.append("자유 스윕 구간이 없습니다")
+    p = _pp(sd)
+    blocks = _blocks(sd)
+    if not blocks:
+        res.notes.append("누름 블록이 없습니다")
         return
+    blk = blocks[0]
+    sid, fs = blk["sensor"], sd.fs(blk["sensor"])
+    tab = block_presses(sd, blk, p)
+    save_presses(sd, tab)
+    report_errors(res, crit, sid, tab)
+    info = direction_info(res, sid, tab, fs)
+    if info:
+        res.metric(sid, "crosstalk_Fx_mag_pct", info["fx"])
+        res.metric(sid, "crosstalk_Fy_mag_pct", info["fy"])
+    if tab.empty:
+        res.notes.append(f"{sid}: {p['hold_s']:g}초 이상 안정 유지된 누름이 없습니다")
+    else:
+        color = _colors(sd)[sid]
+        res.plot(P.error_vs_force(pdir / f"error_{sid}.png", [(sid, color, tab)], f"{sid} · Error per press",
+                                  crit.get("error_max_N")),
+                 f"점 = 누름 1회 ({p['hold_s']:g}초 유지 창 평균의 |F| − 게이지), 선 = 세기 단계별 평균, "
+                 "세로 막대 = 단계 안 최소~최대. 빨간 점선 = 판정 기준")
+        res.tables["세기 단계별 오차 (N)"] = level_table(tab).rename(columns={
+            "level_N": "안내 세기 N", "n": "누름 수", "gauge_N": "게이지 평균 N", "err_mean": "오차 평균 N",
+            "err_std": "오차 1σ N", "err_min": "최소 N", "err_max": "최대 N"})
+    recs = recovery_all(sd, sid, tab, p, crit)
+    report_recovery(res, crit, sid, recs, p)
+    if recs:
+        res.plot(plot_recovery(pdir, sid, recs, crit["zero_residual_N"]),
+                 "뗀 뒤 센서 힘 벡터가 누르기 전 값에서 얼마나 떨어져 있는지 (0.1초 평균). 색 = 누른 세기. "
+                 "회색 띠 안으로 들어오면 복귀")
+    response(sd, res, pdir, sid)
+    alignment_warn(res, crit, tab)
     zero_stats(sd, res, crit, pdir)
-    r = analyze_segment(sd, segs[0], p)
-    sid, fs, df, bt = r["sensor"], r["fs"], r["df"], r["bins"]
-    color = _colors(sd)[sid]
-    res.metric(sid, "n_events", int(len(r["events"])))
-    report_fit(res, crit, r)
-    hy = B.hysteresis_pct_fs(df, fs)
-    rp = B.repeatability_pct_fs(df, fs)
-    res.metric(sid, "hysteresis_pct_fs", hy)
-    res.metric(sid, "repeatability_pct_fs", rp)
-    if np.isfinite(hy):
-        res.check(sid, "hysteresis_pct_fs", hy, crit["hysteresis_pct_fs"])
-    else:
-        res.notes.append("히스테리시스: 상승·하강이 모두 있는 램프가 부족합니다")
-    if np.isfinite(rp):
-        res.check(sid, "repeatability_pct_fs", rp, crit["repeatability_pct_fs"])
-    else:
-        res.notes.append("반복성: 같은 구간에 들어온 접촉이 3회 미만입니다 (펄스를 더 하세요)")
-    ct = B.crosstalk_apex(df, fs)
-    for k, v in ct.items():
-        res.metric(sid, k, v)
-    for k in ("crosstalk_Fx_mag_pct", "crosstalk_Fy_mag_pct"):
-        if k in ct:
-            res.check(sid, k, ct[k], crit["crosstalk_pct"])
-    for k, v in B.torque_consistency(df, fs).items():
-        res.metric(sid, k, v)
-    ds = r["dirstat"]
-    res.metric(sid, "direction_deg", ds["worst_deg"])
-    if np.isfinite(ds["worst_deg"]):
-        res.check(sid, "direction_deg", ds["worst_deg"], crit.get("direction_stability_deg", 3))
-    creep_recovery(sd, r, res, crit, pdir)
-    dynamic(sd, r, res, pdir)
-    alignment_note(res, crit, [r])
-    low_force_note(sd, res, [r])
-    res.tables["커버리지"] = coverage_table([r])
-    res.tables["구간별 집계"] = bt.rename(columns={"label": "구간 (% F.S.)", "n": "샘플", "sec": "체류 s",
-                                              "G_mean": "게이지 평균 N", "err_mean": "오차 평균 N",
-                                              "err_std": "오차 1σ N", "resid_mean": "회귀 잔차 N"}).drop(columns=["bin"])
-    if r["fit"]:
-        res.plot(P.fit_scatter(pdir / f"fit_{sid}.png", B.quasi(df), r["fit"], fs, f"{sid} · 정점 |F| vs 게이지"),
-                 "점 = 준정적 샘플 (색 = 이벤트 종류). 아래는 게이지 대비 오차")
-    if not bt.empty:
-        res.plot(P.bin_residuals(pdir / f"bins_{sid}.png", bt, fs, f"{sid} · 구간별 오차",
-                                 color, crit["nonlinearity_pct_fs"]),
-                 "막대 = 구간 평균 오차, 오차막대 = 1σ(반복성), 숫자 아래는 체류 시간")
-    if np.isfinite(hy):
-        res.plot(P.hysteresis_loops(pdir / f"hyst_{sid}.png", B.quasi(df), fs, f"{sid} · 히스테리시스 루프"),
-                 "실선 = 상승, 점선 = 하강. 둘의 간격이 히스테리시스")
-    if ds.get("mean_dir"):
-        res.plot(P.direction_polar(pdir / f"dir_{sid}.png", {"정점": (ds["mean_dir"], ds["worst_deg"])},
-                                   f"{sid} · 평균 힘 방향"), "정점에서는 중심(= +z)에 가까워야 합니다")
 
 
-def _group_test(sd, res, crit, pdir, kind: str):
-    """R2(위치) / R3(방향) 공통: 구간마다 회귀 → 기준 대비 편차."""
-    p = _p(sd)
-    segs = _segments(sd)
-    if not segs:
-        res.notes.append("자유 스윕 구간이 없습니다")
+def _site_test(sd, res, crit, pdir, kind: str):
+    """R2(위치) / R3(방향): 구간마다 오차 → 기준(정점) 대비 같은 힘에서의 차이."""
+    p = _pp(sd)
+    blocks = _blocks(sd)
+    if not blocks:
+        res.notes.append("누름 블록이 없습니다")
         return
-    zero_stats(sd, res, crit, pdir)
-    rows = [analyze_segment(sd, s, p) for s in segs]
-    sid = rows[0]["sensor"]
-    fs = rows[0]["fs"]
-    worst_dir = [r["dirstat"]["worst_deg"] for r in rows if np.isfinite(r["dirstat"]["worst_deg"])]
-    if worst_dir:
-        res.metric(sid, "direction_deg", float(np.max(worst_dir)), label="방향 안정성 (구간 중 최대)")
-    ref = None
-    tab, dirs, labels, slopes = [], {}, [], []
-    for r in rows:
-        lab = r["seg"]["label"]
-        report_fit(res, crit, r, prefix=lab, checks=False)
-        fit = r["fit"]
-        ds = r["dirstat"]
-        if fit is None:
-            res.notes.append(f"구간 '{lab}': 데이터 부족")
+    sid, fs = blocks[0]["sensor"], sd.fs(blocks[0]["sensor"])
+    tabs = [block_presses(sd, b, p) for b in blocks]
+    alltab = pd.concat([t for t in tabs if len(t)] or [empty_presses()], ignore_index=True)
+    save_presses(sd, alltab)
+    # 기준: 이 세션의 정점 구간(R2) → 없으면 같은 센서의 최신 R1 정점
+    ref_tab, ref_name = pd.DataFrame(), ""
+    apex = alltab[alltab["site"] == "pos:apex"]
+    if len(apex):
+        ref_tab, ref_name = apex, "이 세션의 정점"
+    else:
+        ref_tab, ref_name = _ref_presses(sd, sid, ("R1",))
+        if len(ref_tab):
+            ref_name = f"R1 {ref_name}"
+    ref = _ref_curve(ref_tab) if len(ref_tab) else None
+    if ref is None:
+        res.notes.append("비교 기준(정점) 누름이 없습니다. R1 을 먼저 수행하면 방향별 차이를 판정합니다")
+    rows, groups, worst = [], [], []
+    for k, (b, tab) in enumerate(zip(blocks, tabs)):
+        lab = b["label"]
+        report_errors(res, crit, sid, tab, lab, checks=False)
+        if tab.empty:
+            res.notes.append(f"구간 '{lab}': 유효 누름 없음")
             continue
-        if ref is None:
-            ref = fit["slope"]
-        labels.append(lab)
-        slopes.append(fit["slope"])
-        dirs[lab] = (ds["mean_dir"], ds["worst_deg"])
-        ax, ratio = B.dominant_axis(ds["mean_dir"])
-        tilt = (np.degrees(np.arccos(np.clip(ds["mean_dir"][2], -1, 1))) if ds.get("mean_dir") else np.nan)
-        res.metric(sid, "direction_deg", ds["worst_deg"], label=f"방향 안정성 · {lab}")
-        res.metric(sid, "tilt_deg", tilt, label=f"평균 힘 방향 (z 에서) · {lab}")
-        if np.isfinite(ds["worst_deg"]):
-            res.check(sid, "direction_deg", ds["worst_deg"], crit.get("direction_stability_deg", 3),
-                      label=f"방향 안정성 · {lab}")
-        row = {"구간": lab, "기울기 a": fit["slope"], "절편 b (N)": fit["intercept"],
-               "기준 대비 %": (fit["slope"] / ref - 1) * 100 if ref else np.nan,
-               "비선형성 % F.S.": B.nonlinearity_pct_fs(r["bins"], fs),
-               "방향 안정성 °": ds["worst_deg"], "평균 방향": ax, "지배 성분": ratio,
-               "|F|/게이지": r["align"]["median"]}
-        if kind == "direction":
-            res.metric(sid, "dominant_ratio", ratio, label=f"지배 축 성분 · {lab}")
-        tab.append(row)
-    if not tab:
-        return
-    spread = (max(slopes) - min(slopes)) / np.mean(slopes) * 100 if len(slopes) > 1 else np.nan
-    key = "position_spread_pct" if kind == "position" else "direction_spread_pct"
-    lim = crit["position_spread_pct"] if kind == "position" else crit.get("direction_spread_pct", 10)
-    res.metric(sid, key, spread)
-    if np.isfinite(spread):
-        res.check(sid, key, spread, lim)
-    res.tables["구간별 요약"] = pd.DataFrame(tab)
-    res.tables["커버리지"] = coverage_table(rows)
-    alignment_note(res, crit, rows)
-    low_force_note(sd, res, rows)
-    cols = [P.SERIES[i % len(P.SERIES)] for i in range(len(labels))]
-    res.plot(P.group_slopes(pdir / f"slopes_{sid}.png", labels, slopes, ref, cols,
-                            f"{sid} · {'위치' if kind == 'position' else '방향'}별 기울기", lim),
-             f"첫 구간('{labels[0]}') 대비. 막대 = 기울기 차이")
-    res.plot(P.direction_polar(pdir / f"dirs_{sid}.png", dirs,
-                               f"{sid} · {'위치' if kind == 'position' else '방향'}별 평균 힘 방향"),
-             "기하학적으로 그럴듯한 방향인지 확인 (위치는 바깥쪽으로 기울고, 방향 시험은 90° 부근)")
+        info = direction_info(res, sid, tab, fs, lab)
+        d = diff_vs(tab, ref) if b["site"] != "pos:apex" or ref_name != "이 세션의 정점" else np.zeros(len(tab))
+        md = float(np.nanmean(d)) if np.isfinite(d).any() else np.nan
+        if b["site"] != "pos:apex" and np.isfinite(md):
+            worst.append(abs(md))
+            res.metric(sid, "site_diff_N", md, label=f"기준 대비 오차 차이 · {lab}")
+        rows.append({"구간": lab, "누름 수": len(tab), "오차 평균 N": float(tab["error_N"].mean()),
+                     "최대 |오차| N": float(tab["error_N"].abs().max()),
+                     "기준 대비 차이 N": md, "|F|/게이지": float((tab["Fmag"] / tab["gauge_N"]).median()),
+                     "힘 방향 (z 에서) °": info.get("tilt", np.nan)})
+        groups.append((lab, P.SERIES[k % len(P.SERIES)], tab))
+    if worst:
+        res.check(sid, "site_diff_N", max(worst), crit.get("site_diff_N", 1.0),
+                  label=f"{'위치' if kind == 'position' else '방향'}별 오차 − 기준 (최대)")
+    if rows:
+        res.tables["구간별 요약"] = pd.DataFrame(rows)
+    if groups:
+        ref_item = [("Reference (apex)", P.GAUGE, ref_tab)] if len(ref_tab) and ref_name.startswith("R1") else []
+        res.plot(P.error_vs_force(pdir / f"error_{sid}.png", ref_item + groups,
+                                  f"{sid} · Error per {'position' if kind == 'position' else 'direction'}",
+                                  crit.get("error_max_N")),
+                 f"색 = 구간, 점 = 누름 1회, 선 = 세기 단계별 평균. 기준 = {ref_name or '없음'}")
+    alignment_warn(res, crit, alltab)
+    zero_stats(sd, res, crit, pdir)
 
 
 def a_r2(sd, st, res, crit, pdir):
-    _group_test(sd, res, crit, pdir, "position")
+    _site_test(sd, res, crit, pdir, "position")
 
 
 def a_r3(sd, st, res, crit, pdir):
-    _group_test(sd, res, crit, pdir, "direction")
+    _site_test(sd, res, crit, pdir, "direction")
+
+
+SESSION_MAX = 8          # R4 에서 비교할 최근 세션 수 (이 세션 포함)
+
+
+def _apex_sessions(sd: SessionData, sid: str) -> List[Tuple[str, pd.DataFrame]]:
+    """같은 센서·같은 모드의 R1·R4 세션(중단 제외)별 정점 누름 표. 오래된 것부터."""
+    out = []
+    dirs = [d for code in ("R1", "R4") for d in sd.dir.parent.glob(f"*_{code}_{sid}")]
+    for d in sorted(dirs, key=lambda d: d.name):
+        if d == sd.dir or not (d / "presses.csv").exists():
+            continue
+        try:
+            meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("mode") != sd.meta.get("mode") or meta.get("status") == "aborted":
+            continue
+        t = pd.read_csv(d / "presses.csv")
+        t = t[(t["sensor"] == sid) & (t["site"] == "pos:apex")]
+        if len(t):
+            out.append((d.name, t))
+    return out
+
+
+def _short(name: str) -> str:
+    """20260929_223641_R1_A1 → 09-29 22:36 R1"""
+    p = name.split("_")
+    return f"{p[0][4:6]}-{p[0][6:8]} {p[1][:2]}:{p[1][2:4]} {p[2]}" if len(p) >= 3 and len(p[0]) == 8 else name
+
+
+def a_r4(sd, st, res, crit, pdir):
+    """세션 간 재현성: 이 세션과 같은 센서의 이전 R1·R4 세션을 같은 힘에서 비교한다.
+    세션마다 세기 단계 평균을 이은 오차 곡선 → R4 안내 세기에서 읽고 → 세기마다 세션 간 1σ."""
+    p = _pp(sd)
+    blocks = _blocks(sd)
+    if not blocks:
+        res.notes.append("누름 블록이 없습니다")
+        return
+    blk = blocks[0]
+    sid, fs = blk["sensor"], sd.fs(blk["sensor"])
+    tab = block_presses(sd, blk, p)
+    save_presses(sd, tab)
+    report_errors(res, crit, sid, tab, checks=False)
+    if tab.empty:
+        res.notes.append(f"{sid}: {p['hold_s']:g}초 이상 안정 유지된 누름이 없습니다")
+        return
+    sess = (_apex_sessions(sd, sid) + [(sd.dir.name, tab)])[-SESSION_MAX:]
+    xs = np.array(sorted(blk["levels_N"]), dtype=float)
+    rows, curves = [], []
+    for name, t in sess:
+        ref = _ref_curve(t)
+        lo, hi = float(t["gauge_N"].min()) - 0.1 * fs, float(t["gauge_N"].max()) + 0.1 * fs
+        e = np.array([np.interp(x, ref[0], ref[1]) if lo <= x <= hi else np.nan for x in xs])
+        curves.append(e)
+        rows.append({"세션": name + (" (이 세션)" if name == sd.dir.name else ""), "누름 수": len(t),
+                     **{f"{x:g} N 오차": v for x, v in zip(xs, e)}})
+    E = np.vstack(curves)
+    n_ok = np.sum(np.isfinite(E), axis=0)
+    res.metric(sid, "n_sessions", len(sess))
+    if (n_ok >= 2).any():
+        sd_lv = np.array([np.nanstd(E[:, j], ddof=1) if n_ok[j] >= 2 else np.nan for j in range(len(xs))])
+        rg_lv = np.array([np.nanmax(E[:, j]) - np.nanmin(E[:, j]) if n_ok[j] >= 2 else np.nan
+                          for j in range(len(xs))])
+        worst = float(np.nanmax(sd_lv))
+        res.metric(sid, "session_std_N", worst)
+        res.metric(sid, "session_range_N", float(np.nanmax(rg_lv)))
+        res.check(sid, "session_std_N", worst, crit.get("session_std_N", 0.3), label="세션 간 산포 (같은 힘 1σ)")
+        rows.append({"세션": "세션 간 1σ", "누름 수": np.nan, **{f"{x:g} N 오차": v for x, v in zip(xs, sd_lv)}})
+    else:
+        res.notes.append(f"{sid}: 비교할 이전 세션(R1·R4)이 없습니다. R1 이나 R4 를 한 번 더 하면 판정합니다")
+    res.tables["세션별 오차 (같은 힘, N)"] = pd.DataFrame(rows)
+    groups = []
+    for k, (name, t) in enumerate(sess):
+        t = t if name == sd.dir.name else t.assign(_hollow=True)
+        groups.append((_short(name), P.SERIES[k % len(P.SERIES)], t))
+    res.plot(P.error_vs_force(pdir / f"error_{sid}.png", groups, f"{sid} · Error per session",
+                              crit.get("error_max_N")),
+             "색 = 세션 (채운 점 = 이 세션, 빈 점·점선 = 이전 R1·R4). 같은 힘에서 선들이 벌어진 정도가 세션 간 산포")
+    alignment_warn(res, crit, tab)
+    zero_stats(sd, res, crit, pdir, check=False)
 
 
 # ── 다중 센서 ─────────────────────────────────────────────────────
@@ -566,18 +641,18 @@ def rate_stats(sd, res, crit, pdir, long_term: bool = False):
     ax1, ax2 = axes[0]
     cols = [colors[s] for s in labels]
     ax1.bar(labels, rates, 0.6, color=cols)
-    ax1.plot(labels, noms, "_", color=P.INK, ms=22, mew=1.5, label="기대 샘플레이트")
-    ax1.set_title(f"실효 샘플레이트 ({len(labels)}개 연결)")
+    ax1.plot(labels, noms, "_", color=P.INK, ms=22, mew=1.5, label="Expected rate")
+    ax1.set_title(f"Effective sample rate ({len(labels)} connected)")
     ax1.set_ylabel("Hz")
     ax1.legend(loc="lower right")
     ax2.bar(labels, drops, 0.6, color=cols)
-    ax2.axhline(crit["frame_drop_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"기준 {crit['frame_drop_pct']:g} %")
-    ax2.set_title("프레임 누락")
+    ax2.axhline(crit["frame_drop_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"Limit {crit['frame_drop_pct']:g} %")
+    ax2.set_title("Dropped frames")
     ax2.set_ylabel("%")
     ax2.legend()
     res.plot(P.save(fig, pdir / "rate.png"), "센서별 실효 샘플레이트와 프레임 누락")
     if items:
-        res.plot(P.curves(pdir / "longterm.png", items, "무하중 장시간 |F|", "분", "|F| (N)",
+        res.plot(P.curves(pdir / "longterm.png", items, "Zero-load long-term |F|", "Time (min)", "|F| (N)",
                           band=crit["zero_residual_N"]), "센서별 무하중 출력 추이")
 
 
@@ -589,121 +664,111 @@ def a_rm1(sd, st, res, crit, pdir):
                      f"'센서 비교 리포트' 에서 실효 Hz 를 비교하세요")
 
 
-def _ref_fit(sd: SessionData, sid: str, code: str = "R1") -> Optional[Dict]:
-    """같은 센서의 최신 단일 연결 세션에서 기울기·절편."""
-    for d in sorted(sd.dir.parent.glob(f"*_{code}_{sid}"), reverse=True):
-        f = d / "metrics.csv"
-        try:
-            same = json.loads((d / "meta.json").read_text(encoding="utf-8")).get("mode") == sd.meta.get("mode")
-        except Exception:
-            same = False
-        if f.exists() and same:
-            m = pd.read_csv(f)
-            m = m[(m["sensor"] == sid) & m["name"].isin(["slope", "intercept"])]
-            m = m.drop_duplicates("name", keep="first").set_index("name")["value"]
-            if {"slope", "intercept"} <= set(m.index):
-                return {"slope": float(m["slope"]), "intercept": float(m["intercept"]), "session": d.name}
-    return None
+def _multi_errors(sd, res, crit, blocks, tabs, ref_codes, key_label: str) -> List[Tuple[str, str, pd.DataFrame]]:
+    """다중 연결·동시 하중: 누른 센서마다 단일(R1) 대비 같은 힘에서의 오차 차이."""
+    colors = _colors(sd)
+    groups = []
+    for b, tab in zip(blocks, tabs):
+        sid, lab = b["sensor"], b["label"]
+        report_errors(res, crit, sid, tab, lab, checks=False)
+        if tab.empty:
+            res.notes.append(f"구간 '{lab}': 유효 누름 없음")
+            continue
+        ref_tab, ref_name = _ref_presses(sd, sid, ref_codes)
+        if len(ref_tab):
+            d = diff_vs(tab, _ref_curve(ref_tab))
+            md = float(np.nanmean(d))
+            res.metric(sid, "multi_diff_N", md, label=f"{key_label} · {lab}")
+            res.check(sid, "multi_diff_N", md, crit.get("multi_diff_N", 0.3), label=f"{key_label} · {lab}")
+            res.notes.append(f"{sid}: 비교 기준 {ref_name}")
+            groups.append((f"{sid} single (R1)", colors[sid], ref_tab.assign(_hollow=True)))
+        else:
+            res.notes.append(f"{sid}: 비교할 단일 연결 R1 세션이 없습니다 (R1 을 먼저 수행하세요)")
+        groups.append((lab, colors[sid], tab))
+    return groups
 
 
 def a_rm2(sd, st, res, crit, pdir):
-    p = _p(sd)
-    segs = _segments(sd)
-    if not segs:
-        res.notes.append("자유 스윕 구간이 없습니다")
+    p = _pp(sd)
+    blocks = _blocks(sd)
+    if not blocks:
+        res.notes.append("누름 블록이 없습니다")
         return
-    noise = zero_stats(sd, res, crit, pdir, check=False)
-    rows = [analyze_segment(sd, s, p) for s in segs]
-    inter, maprows, labels = [], [], []
-    for r in rows:
-        sid = r["sensor"]
-        seg = r["seg"]
-        report_fit(res, crit, r, prefix=f"{len(sd.sensor_ids)}개 연결")
-        ref = _ref_fit(sd, sid, "R1")
-        if r["fit"] and ref:
-            fs = r["fs"]
-            dpct = (r["fit"]["slope"] - ref["slope"]) / ref["slope"] * 100
-            doff = r["fit"]["intercept"] - ref["intercept"]
-            d50 = _delta_at(r["fit"], ref, 0.5 * fs) / fs * 100
-            res.metric(sid, "slope_diff_pct", dpct)
-            res.metric(sid, "offset_diff_N", doff)
-            res.metric(sid, "delta_half_pct_fs", d50)
-            res.check(sid, "slope_diff_pct", dpct, crit["multi_slope_diff_pct"])
-            res.check(sid, "delta_half_pct_fs", d50, crit.get("multi_delta_pct_fs", 1.0))
-            res.notes.append(f"{sid}: 비교 기준 {ref['session']}")
-        elif r["fit"]:
-            res.notes.append(f"{sid}: 비교할 단일 연결 R1 세션이 없습니다 (R1 을 먼저 수행하세요)")
-        # 이 구간에 하중을 받지 않은 센서들의 출력 변화 = 채널 간섭 + 매핑
+    tabs = [block_presses(sd, b, p) for b in blocks]
+    save_presses(sd, pd.concat(tabs, ignore_index=True))
+    groups = _multi_errors(sd, res, crit, blocks, tabs, ("R1",), "단일(R1) 대비 오차 차이")
+    if groups:
+        res.plot(P.error_vs_force(pdir / "error_multi.png", groups,
+                                  f"Error with {len(sd.sensor_ids)} connected vs. single (R1)", crit.get("error_max_N")),
+                 "색 = 센서. 채운 점 = 이번(다중 연결), 빈 점 = 같은 센서의 단일 연결(R1)")
+    maprows, labels = [], []
+    for b in blocks:
+        sid = b["sensor"]
         peaks = {}
-        for other in sd.sensor_ids:
-            t, y = _series(sd, other, seg["t0"], seg["t1"])
+        for other in sd.sensor_ids:        # 이 구간에 하중을 받지 않은 센서들의 출력 변화 = 채널 간섭 + 매핑
+            t, y = _series(sd, other, b["t0"], b["t1"])
             if len(t) < 10:
                 continue
             base = float(np.nanmedian(y[: max(5, len(y) // 20)]))
             peaks[other] = _smoothed_peak(t, y - base)
         if not peaks:
             continue
-        labels.append(seg["label"])
+        labels.append(b["label"])
         maprows.append(peaks)
         others = {k: v for k, v in peaks.items() if k != sid}
         if others:
             worst = max(others.values())
-            res.metric(sid, "max_channel_crosstalk_N", worst, label=f"{sid} 하중 시 타 채널 최대 변화")
+            res.metric(sid, "max_channel_crosstalk_N", worst, label=f"{sid} 누를 때 다른 채널 최대 변화")
             res.check(sid, "max_channel_crosstalk_N", worst, crit["channel_crosstalk_N"])
-            inter.append({"하중 센서": sid, **{k: v for k, v in others.items()}})
         got = max(peaks, key=peaks.get)
-        res.check(sid, "mapping_ok", got == sid, 1, mode="bool", label=f"하중 → 가장 크게 반응한 채널 = {got}")
+        res.check(sid, "mapping_ok", got == sid, 1, mode="bool", label=f"누른 센서 → 가장 크게 반응한 채널 = {got}")
     if maprows:
         ids = sd.sensor_ids
         m = np.array([[row.get(i, np.nan) for i in ids] for row in maprows])
-        res.tables["구간별 채널 응답 피크 (N)"] = pd.DataFrame(m, index=[f"하중:{l}" for l in labels], columns=ids)
-        res.plot(P.matrix(pdir / "channel_map.png", m, labels, ids, "채널 응답 (구간별 |F| 최대 변화)",
-                          "피크 Δ|F| (N)", fmt="{:.2f}", row_title="스윕한 센서", col_title="관찰 채널"),
+        res.tables["구간별 채널 응답 피크 (N)"] = pd.DataFrame(m, index=[f"누름:{l}" for l in labels], columns=ids)
+        res.plot(P.matrix(pdir / "channel_map.png", m, labels, ids, "Channel response (max |F| change per block)",
+                          "Peak Δ|F| (N)", fmt="{:.2f}", row_title="Pressed sensor", col_title="Observed channel"),
                  "대각선만 진하면 매핑 정상이고 채널 간섭이 없다는 뜻")
-    res.tables["커버리지"] = coverage_table(rows)
-    alignment_note(res, crit, rows)
-    res.notes.append("단일(R1) 대비 비교는 그 사이 지그를 다시 물린 효과도 함께 포함합니다. 절편 차이가 "
-                     "기준을 조금 넘으면 다중 연결 탓인지 재장착 탓인지 R1 을 한 번 더 재서 구분하세요")
+    alignment_warn(res, crit, pd.concat(tabs, ignore_index=True))
+    zero_stats(sd, res, crit, pdir, check=False)
+    res.notes.append("단일(R1) 대비 비교는 그 사이 지그를 다시 물린 효과도 함께 포함합니다. 차이가 기준을 조금 넘으면 "
+                     "다중 연결 탓인지 재장착 탓인지 R1 을 한 번 더 재서 구분하세요")
 
 
 def a_rm3(sd, st, res, crit, pdir):
-    p = _p(sd)
-    segs = _segments(sd)
-    if not segs:
-        res.notes.append("자유 스윕 구간이 없습니다")
+    p = _pp(sd)
+    blocks = _blocks(sd)
+    if not blocks:
+        res.notes.append("누름 블록이 없습니다")
         return
     noise = zero_stats(sd, res, crit, pdir, check=False)
-    rows = [analyze_segment(sd, s, p) for s in segs]
-    tab = []
-    for r in rows:
-        sid, seg = r["sensor"], r["seg"]
-        report_fit(res, crit, r, prefix=seg["label"])
-        ref = _ref_fit(sd, sid, "RM2") or _ref_fit(sd, sid, "R1")
-        if r["fit"] and ref:
-            dpct = (r["fit"]["slope"] - ref["slope"]) / ref["slope"] * 100
-            d50 = _delta_at(r["fit"], ref, 0.5 * r["fs"]) / r["fs"] * 100
-            res.metric(sid, "slope_diff_pct", dpct, label=f"단독 대비 기울기 차이 · {seg['label']}")
-            res.metric(sid, "delta_half_pct_fs", d50, label=f"50 % F.S. 읽음 차이 · {seg['label']}")
-            res.check(sid, "delta_half_pct_fs", d50, crit.get("multi_delta_pct_fs", 1.0),
-                      label=f"동시 하중 중 읽음 차이 · {seg['label']}")
-        for other in seg["static"]:
-            t, y = _series(sd, other, seg["t0"], seg["t1"])
+    tabs = [block_presses(sd, b, p) for b in blocks]
+    save_presses(sd, pd.concat(tabs, ignore_index=True))
+    groups = _multi_errors(sd, res, crit, blocks, tabs, ("R1",), "동시 하중 중 오차 − 단일(R1)")
+    if groups:
+        res.plot(P.error_vs_force(pdir / "error_simul.png", groups, "Error while other sensors are loaded",
+                                  crit.get("error_max_N")),
+                 "색 = 누른 센서. 채운 점 = 다른 센서에 정하중을 건 상태, 빈 점 = 단일 연결(R1)")
+    tab_rows = []
+    for b in blocks:
+        for other in b["static"]:
+            t, y = _series(sd, other, b["t0"], b["t1"])
             if len(t) < 20:
                 continue
             sdv = float(np.nanstd(y))
             base = noise.get(other, np.nan)
             ratio = sdv / base if base and np.isfinite(base) and base > 1e-6 else np.nan
-            res.metric(other, "static_std_N", sdv, label=f"정하중 채널 1σ · {seg['label']}")
-            res.metric(other, "static_ratio", ratio, label=f"정하중 흔들림 배수 · {seg['label']}")
+            res.metric(other, "static_std_N", sdv, label=f"정하중 채널 1σ · {b['label']}")
+            res.metric(other, "static_ratio", ratio, label=f"정하중 흔들림 배수 · {b['label']}")
             if np.isfinite(ratio):
                 res.check(other, "static_ratio", ratio, crit.get("simul_load_ratio", 2.0),
-                          label=f"{other} 정하중 안정성 ({seg['label']})")
-            tab.append({"구간": seg["label"], "스윕": sid, "정하중": other, "정하중 평균 N": float(np.nanmean(y)),
-                        "정하중 1σ N": sdv, "자체 노이즈 1σ N": base, "배수": ratio})
-    if tab:
-        res.tables["동시 하중 간섭"] = pd.DataFrame(tab)
-    res.tables["커버리지"] = coverage_table(rows)
-    alignment_note(res, crit, rows)
+                          label=f"{other} 정하중 안정성 ({b['label']})")
+            tab_rows.append({"구간": b["label"], "누른 센서": b["sensor"], "정하중": other,
+                             "정하중 평균 N": float(np.nanmean(y)), "정하중 1σ N": sdv, "자체 노이즈 1σ N": base,
+                             "배수": ratio})
+    if tab_rows:
+        res.tables["동시 하중 간섭"] = pd.DataFrame(tab_rows)
+    alignment_warn(res, crit, pd.concat(tabs, ignore_index=True))
 
 
 def a_rm4(sd, st, res, crit, pdir):
@@ -711,7 +776,92 @@ def a_rm4(sd, st, res, crit, pdir):
     zero_stats(sd, res, crit, pdir)
 
 
+PLATE = "Σ"      # RM5 합력의 지표·표에 쓰는 센서 이름
+
+
+def _plate_vectors(sd: SessionData, ids: List[str]) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """첫 센서의 시각 격자에 모든 센서의 (Fx, Fy, Fz) 를 보간해 맞춘다 → (t, {센서: (n, 3)})."""
+    t = sd.sensor_df(ids[0])["t"].to_numpy(dtype=float)
+    vec = {}
+    for sid in ids:
+        d = sd.sensor_df(sid).sort_values("t")
+        if len(d) < 2:
+            return np.empty(0), {}
+        vec[sid] = np.column_stack([np.interp(t, d["t"].to_numpy(dtype=float), d[k].to_numpy(dtype=float),
+                                              left=np.nan, right=np.nan) for k in ("Fx", "Fy", "Fz")])
+    return t, vec
+
+
+def a_rm5(sd, st, res, crit, pdir):
+    """판 누름: 4개 합력 |ΣF| (판 무게를 뺀 벡터 합) 을 게이지와 비교. 센서 좌표계가 같은 방향이라고 본다."""
+    p = _pp(sd)
+    blocks = [b for b in _blocks(sd) if b["group"] == "plate"]
+    if not blocks:
+        res.notes.append("판 누름 블록이 없습니다")
+        return
+    ids = sd.sensor_ids
+    t, vec = _plate_vectors(sd, ids)
+    if not len(t):
+        res.notes.append(f"센서 {', '.join(ids)} 중 PXSR 데이터가 없는 센서가 있습니다. 채널 설정을 확인하세요")
+        return
+    # 판 무게: 판만 올린 구간의 센서별 평균 벡터
+    ev = sd.events[sd.events["action"] == "plate_base"] if not sd.events.empty else pd.DataFrame()
+    base = {sid: np.zeros(3) for sid in ids}
+    if len(ev):
+        a, b = float(ev.iloc[-1]["t_start"]), float(ev.iloc[-1]["t_end"])
+        m = (t >= a) & (t <= b)
+        if m.sum() > 5:
+            base = {sid: np.nanmean(vec[sid][m], axis=0) for sid in ids}
+            w = float(np.linalg.norm(sum(base.values())))
+            res.metric(PLATE, "plate_weight_N", w, unit="N", label="판 무게 (센서 합, 빼고 봄)")
+    else:
+        res.notes.append("판 무게 기록 구간이 없어 판 무게를 빼지 않았습니다")
+    load = {sid: vec[sid] - base[sid] for sid in ids}
+    tot = sum(load.values())
+    comb = pd.DataFrame({"t": t, "Fx": tot[:, 0], "Fy": tot[:, 1], "Fz": tot[:, 2],
+                         "Fmag": np.linalg.norm(tot, axis=1)}).dropna()
+    tabs, shares = [], []
+    for blk in blocks:
+        tg, g = _gauge(sd, blk["t0"], blk["t1"])
+        found = PR.find_presses(tg, g, p)
+        cx = comb[(comb["t"] >= blk["t0"] - 3) & (comb["t"] <= blk["t1"] + 3)]
+        tab = PR.press_table(found, tg, g, cx, p)
+        if tab.empty:
+            res.notes.append(f"'{blk['label']}': {p['hold_s']:g}초 이상 안정 유지된 누름이 없습니다")
+            continue
+        tab["level_N"] = PR.assign_levels(tab, blk["levels_N"])
+        for k in ("c0", "c1", "rest_s"):
+            tab[k] = found[k].to_numpy()
+        tab["sensor"], tab["label"], tab["site"], tab["group"] = PLATE, blk["label"], blk["site"], blk["group"]
+        tabs.append(tab[PRESS_COLS])
+        for r in tab.itertuples():          # 누름마다 센서별 분담 (각 센서 |F| 의 합 대비 비율)
+            m = (t >= r.t0) & (t <= r.t1)
+            mags = {sid: float(np.linalg.norm(np.nanmean(load[sid][m], axis=0))) for sid in ids}
+            s = sum(mags.values())
+            shares.append({"안내 N": r.level_N, "게이지 N": r.gauge_N,
+                           **{f"{sid} N": mags[sid] for sid in ids},
+                           **{f"{sid} %": 100 * mags[sid] / s if s > 0 else np.nan for sid in ids}})
+    if not tabs:
+        return
+    tab = pd.concat(tabs, ignore_index=True)
+    save_presses(sd, tab)
+    report_errors(res, crit, PLATE, tab, "4개 합력", checks=False)
+    emax = float(np.nanmax(np.abs(tab["error_N"])))
+    res.check(PLATE, "error_max_N", emax, crit.get("plate_error_max_N", 2.0), label="4개 합력 최대 |오차|")
+    sh = pd.DataFrame(shares)
+    res.tables["누름별 센서 분담 (판 무게 뺌)"] = sh
+    pct = sh[[f"{sid} %" for sid in ids]]
+    res.metric(PLATE, "plate_share_max_pct", float(pct.to_numpy().max()), unit="%",
+               label="한 센서의 최대 분담 (고르면 25 %)")
+    res.plot(P.error_vs_force(pdir / "error_plate.png", [("|ΣF| (4 sensors)", P.SERIES[0], tab)],
+                              "Plate press: sum of 4 sensors vs. gauge", crit.get("plate_error_max_N", 2.0)),
+             "점 = 누름 1회의 |ΣF| − 게이지 (판 무게를 뺀 4개 벡터 합). 선 = 세기 단계별 평균")
+    res.notes.append("합력은 센서 좌표계가 모두 같은 방향(정점이 위)이라고 보고 벡터로 더합니다. 센서가 기울어 있으면 "
+                     "옆 성분이 서로 상쇄되지 않아 |ΣF| 가 달라집니다")
+    zero_stats(sd, res, crit, pdir, check=False)
+
+
 ANALYZERS_V2: Dict[str, Callable] = {
-    "R0": a_r0, "R1": a_r1, "R2": a_r2, "R3": a_r3,
-    "RM1": a_rm1, "RM2": a_rm2, "RM3": a_rm3, "RM4": a_rm4,
+    "R0": a_r0, "R1": a_r1, "R2": a_r2, "R3": a_r3, "R4": a_r4,
+    "RM1": a_rm1, "RM2": a_rm2, "RM3": a_rm3, "RM4": a_rm4, "RM5": a_rm5,
 }

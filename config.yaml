@@ -8,53 +8,69 @@ output_dir: ./sessions     # 세션 산출물 위치 (이 파일 기준 상대�
 sensor_types:
   A:
     label: "Elite Type A"
-    rated_N: 50            # TODO: 실제 정격(F.S.) 확인
+    rated_N: 25            # 정격(F.S.) 25 N (제조사 확인)
     rate_hz: 200           # 기대 샘플레이트 (RM1 판정용)
     ball_tip: "볼 팁 Ø5"    # v2 기본 팁 (곡면용)
     flat_tip: "평면 Ø10"    # v1 테스트에서만 사용
     point_tip: "소구경 Ø3"
   B:
     label: "Elite Type B"
-    rated_N: 30            # TODO
+    rated_N: 25            # 정격(F.S.) 25 N (제조사 확인)
     rate_hz: 150
     ball_tip: "볼 팁 Ø4"
     flat_tip: "평면 20×20"
     point_tip: "소구경 Ø5"
 
 # hand = 실사용 손 구성 (L/R). 다중 연결 테스트는 손 단위(4개)로 수행한다.
-# TODO: 실제 손별 구성 확인 후 수정 (test-plan-v2.md §9)
+# channel = PXSR CSV 열 이름 "<n>-2-..." 의 n. PXSR 는 지금 연결된 센서끼리 0 부터 번호를 매긴다
+#   → 센서 1개만 연결하면 항상 0 (단일 테스트는 번호와 무관하게 동작), 한 손 4개 연결 시 0~3.
+#   손은 따로 연결하므로 두 손이 같은 번호를 써도 된다.
+# 2026-09-30 RM2 실측(왼손 4개): ch0 = B, ch1 = A, ch2 = B, ch3 = A (taxel 52/31 개로 타입 확인).
+#   A1 단계에서 눌린 채널 = ch3 → A1=3, A2=1 로 추정. B1/B2 순서와 오른손은 미확인 (같은 배치로 가정)
+# TODO: 센서를 하나씩 눌러 채널 확인 후 수정 (tools/live_check.py 또는 PXSR 화면)
 sensors:
-  - {id: A1, type: A, channel: 0, hand: L}
+  - {id: A1, type: A, channel: 3, hand: L}
   - {id: A2, type: A, channel: 1, hand: L}
-  - {id: B1, type: B, channel: 4, hand: L}
-  - {id: B2, type: B, channel: 5, hand: L}
-  - {id: A3, type: A, channel: 2, hand: R}
-  - {id: A4, type: A, channel: 3, hand: R}
-  - {id: B3, type: B, channel: 6, hand: R}
-  - {id: B4, type: B, channel: 7, hand: R}
+  - {id: B1, type: B, channel: 0, hand: L}
+  - {id: B2, type: B, channel: 2, hand: L}
+  - {id: A3, type: A, channel: 3, hand: R}
+  - {id: A4, type: A, channel: 1, hand: R}
+  - {id: B3, type: B, channel: 0, hand: R}
+  - {id: B4, type: B, channel: 2, hand: R}
 
 # ── Force gauge (ZP-500N, 시리얼) ─────────────────────────────────
 gauge:
-  port: COM3               # TODO: 장치 관리자에서 확인
-  baudrate: 19200          # Imada ZP 호환 가정
-  mode: poll               # poll: 명령 보내고 응답 읽기 | stream: 게이지가 연속 송신
-  poll_command: "D\r"      # Imada 호환 '현재값 요청' 가정
+  port: COM7               # FTDI USB Serial Port (2026-09-29 확인)
+  baudrate: 2400           # 실측. 8N1
+  mode: stream             # poll: 명령 보내고 응답 읽기 | stream: 게이지가 연속 송신 (실측: 약 10 Hz)
+  poll_command: "D\r"      # poll 모드에서만 사용
   poll_hz: 50
-  line_terminator: "\r"
+  line_terminator: ""      # 실측: 구분자 없음 ("0000.0-000.3-004.9...") → record_regex 로 자른다
+  # 레코드 한 개. N 단위 실측은 고정폭 6글자, 첫 글자가 부호 자리('-' 또는 '0'), 소수 1자리.
+  # 게이지 단위를 kgf 로 바꾸면 "-00.00" 형식이 되므로 "[-+ \\d]\\d{2}\\.\\d{2}" 로 바꾼다.
+  record_regex: "[-+ \\d]\\d{3}\\.\\d"
+  record_len: 6            # 레코드 글자 수. 버퍼 끝의 레코드가 이 길이면 다음 레코드를 기다리지 않고 바로 쓴다
   line_regex: "([-+]?\\d+(?:\\.\\d+)?)"   # 응답에서 숫자 추출 (첫 그룹)
-  unit_scale: 1.0          # 게이지 단위 → N (kgf면 9.80665)
-  invert: false            # 압축(누름)이 + 가 되도록
+  unit_scale: 1.0          # 게이지 단위 → N (kgf면 9.80665). 게이지 표시 단위는 N 으로 설정해 둠
+  invert: true             # 압축(누름)이 + 가 되도록. 실측: 누르면 '-' 로 온다
   timeout_s: 0.2
-  accuracy_N: 2.5          # ± 정확도. ZP-500N ±0.5 % F.S. 가정 (test-plan-v2.md §3.1)
-  low_force_valid_N: null  # 이 값 미만은 판정 보류. null 이면 accuracy_N × 4
+  accuracy_N: 0.1          # ± 정확도 (참고). 표기 0.2 %. 실측: 0.5 kg 분동 → 4.9 N (기준 4.90 N), 분해능 0.1 N 이내
 
 # ── PXSR CSV (공식 Windows 프로그램 출력) ─────────────────────────
 pxsr:
-  output_dir: "C:/PXSR/data"          # TODO: PXSR 저장 폴더
+  output_dir: "C:/Users/lklab-window/AppData/Roaming/pxsr-gen3/DataLogging"   # pxsr-gen3 기본 저장 폴더
   file_glob: "*.csv"
   delimiter: ","
-  timestamp_col: timestamp            # 없으면 첫 열 사용
-  timestamp_unit: auto                # ms | s | auto
+  timestamp_col: timestamp            # 없으면 첫 열 사용. 실측: "HH:MM:SS.mmm" (날짜는 파일명 YYYY-MM-DD-HHMMSS)
+  timestamp_unit: auto                # ms | s | auto (숫자 타임스탬프일 때만)
+  # 실제 PXSR 은 한 파일에 센서 여러 개: "<n>-2-1x1-X/Y/Z" 가 센서 n 의 합력. n 을 sensors[].channel 에 맞춘다
+  wide_col_regex: "^(\\d+)-\\d+-1x1-([XYZ])$"
+  # taxel 좌표 (PXSR 앱에서 추출). 있으면 taxel 법선 값으로 접촉 중심(CoP)과 토크(= CoP × 합력)를 계산한다
+  taxel_geometry: paxtest/devices/geometry/S1813E.json
+  cop_min_taxel_sum: 5                # taxel 법선 raw 합이 이 값 미만이면 CoP 를 비운다 (무접촉)
+  # raw 정수 → N. PXSR 은 CSV 에 raw(combineForce)를 쓰고 화면엔 /10 해서 N 으로 표시한다 (앱 코드 확인, 0.1 N 단위).
+  # 게이지 대비 실제 정확도는 R1 기울기로 본다
+  force_scale: 0.1
   columns: {Fx: Fx, Fy: Fy, Fz: Fz, Tx: Tx, Ty: Ty, Tz: Tz}
   channel_col: null                   # 한 파일에 여러 센서가 섞일 때 채널 열 이름
   file_channel_regex: "ch(\\d+)"      # 센서별 파일일 때 파일명에서 채널 추출
@@ -63,7 +79,7 @@ pxsr:
 
 # ── 카메라 (영상 로깅) ────────────────────────────────────────────
 camera:
-  enabled: true
+  enabled: false           # 2026-09-29: 연결된 카메라 없음
   index: 0
   width: 1280
   height: 720
@@ -86,72 +102,68 @@ procedure:
 
   # v2 (자유 스윕, R/RM 테스트) — test-plan-v2.md §4
   v2:
-    head_zero_s: 20        # 세션 머리 무하중
+    head_zero_s: 15        # 세션 머리 무하중
     tap_s: 8               # 싱크 탭 구간 (3회 탭)
-    tail_zero_s: 30        # 세션 꼬리 무하중 (영점 복귀)
-    r0_zero_s: 90          # R0 정지 세션
+    tail_zero_s: 15        # 세션 꼬리 무하중 (영점 복귀)
+    r0_zero_s: 15          # R0 정지 세션 (20 s 미만이면 드리프트는 계산하지 않음 → 장시간 드리프트는 RM4)
+    rm1_zero_s: 15         # RM1 연결 수별 무하중
     rm4_zero_s: 1800       # RM4 장시간
-    positions: ["정점", "+x", "-x", "+y", "-y"]      # R2 위치 스윕 (첫 항목 = 기준)
-    directions: ["+x", "-x", "+y", "-y"]             # R3 방향별. 없는 면은 지우세요
-    shear: false           # R3 에 전단(접착 패드) 구간 추가
+    positions: ["+x", "-x"]                          # R2 위치별. 기준 = 같은 센서의 최신 R1 정점 ("정점" 을 넣으면 이 세션 정점이 기준)
+    directions: ["+x", "-x"]                         # R3 방향별 (옆면, 90° 지그). ±y 는 보지 않음 (2026-09-30)
     rm3_static_N_hint: 5   # RM3 정하중 안내값 (측정하지 않음)
+    plate_base_s: 5        # RM5 판만 올린 상태 기록 (판 무게를 빼는 기준)
 
-    # 구간별 커버리지 목표 (이 값이 모두 차면 '종료 가능')
-    coverage:
-      apex:      {ramp: 3, pulse: 10, hold: 2, step: 5, bins: 8, bin_s: 2.0}
-      position:  {ramp: 2, pulse: 3, bins: 5, bin_s: 1.0}
-      direction: {ramp: 2, pulse: 3, bins: 5, bin_s: 1.0}
-      multi:     {ramp: 2, pulse: 5, bins: 5, bin_s: 1.0}
+    # 누름 블록 행동강령 (test-plan-v2.md §4): 안내 세기로 누름 → hold_s 유지 → 떼기 → rest_s 쉬기.
+    # 유지·쉬기는 게이지로 자동 판정한다. 시간 값은 리허설 시간 배율에 따라 줄어든다
+    press:
+      hold_s: 3              # 게이지가 안정된 채 이 시간 유지하면 1회로 셈
+      rest_s: 3              # 뗀 뒤 손대지 않는 시간 = 영점 복귀 관찰 창 (criteria.zero_recovery_s 이상)
+      settle_s: 0.5          # 유지 구간 앞쪽에서 평균에 넣지 않는 시간
+      stable_tol_pct: 3      # 유지 중 게이지 흔들림 허용 (읽음의 %)
+      stable_min_N: 0.3      # 위 허용폭의 하한 (N)
+      contact_N: 0.5         # 게이지가 이 값을 넘으면 접촉 중
+      levels_pct:            # 안내 세기 (% 정격, 0.5 N 단위로 반올림). 낮은 것부터 한 바퀴 = 1회 반복. 최대 48 % (25 N 정격 → 12 N)
+        apex:  [12, 24, 36, 48]        # R1 → 3 / 6 / 9 / 12 N. 모든 테스트가 같은 세기 → 같은 힘에서 바로 비교
+        site:  [12, 24, 36, 48]        # R2 위치별
+        multi: [12, 24, 36, 48]        # RM2, RM3
+        session: [12, 24, 36, 48]      # R4 세션 간 재현성
+        plate: [12, 24, 36, 48]        # RM5 판 누름. 기준 = 4개 정격의 합(100 N) → 전체 12/24/36/48 N (센서당 평균 3/6/9/12)
+      reps: {apex: 3, site: 2, multi: 2, session: 1, plate: 2}
 
-    # 이벤트 검출·분류 임계 (test-plan-v2.md §6). 시간 값은 시간 배율에 따라 축소된다
-    detect:
-      contact_min_N: 0.5             # 접촉 판정 하한 (max(이 값, 노이즈 σ × k))
-      contact_sigma_k: 5
-      contact_min_s: 0.3             # 이보다 짧은 접촉은 무시
-      gap_merge_s: 0.15              # 이보다 짧은 끊김은 한 이벤트로 병합
-      quasi_static_pct_fs_per_s: 15  # |dG/dt| 가 이보다 작으면 준정적 샘플
-                                     # (10초 램프 = 10 %F.S./s 가 포함되도록. 동기 오차 10 ms 기준 0.15 %F.S.)
-      smooth_s: 0.2
-      bin_pct: 10                    # 구간(bin) 폭 (% F.S.)
-      merge_tol_s: 0.02              # 게이지 ↔ PXSR nearest merge 허용
-      ramp_min_peak_pct: 80          # 램프: 최고점 ≥ 이 값 (% F.S.)
-      ramp_min_edge_s: 6             # 램프: 10→90 % 상승·하강이 각각 ≥ 이 시간
-                                     # (10초 램프의 10→90 % 는 6~8초)
-      pulse_max_s: 4
-      pulse_peak_lo_pct: 10
-      pulse_peak_hi_pct: 80
-      hold_min_plateau_s: 20         # 홀드: 플라토 ≥ 이 시간
-      hold_plateau_tol_pct_fs: 3
-      step_max_rise_s: 0.15          # 스텝: 10→90 % 상승 ≤ 이 시간
-      step_min_peak_pct: 15
-      step_max_s: 12
+    # 빠른 입력 (R1 끝, 응답 시간). 센서 신호만으로 상승·하강 10→90 % 시간을 잰다
+    fast:
+      record_s: 40
+      taps: 5                # 딱딱한 물체로 톡
+      releases: 5            # 눌렀다가 한 번에 떼기
 
-# ── 판정 기준 (test-plan-v2.md §7, 초안) ─────────────────────────
+# ── 판정 기준 (test-plan-v2.md §7, 초안 — 제조사 스펙 확인 후 확정) ──
 criteria:
-  # v2
-  slope_tol: 0.03                # |F| = a·G + b 의 a 가 1 ± 이 값
-  direction_stability_deg: 3     # 램프 중 단위벡터 방향 편차 (95 %)
-  alignment_ratio_max: 1.05      # |F|/게이지 중앙값 (초과 시 측력 의심 경고)
-  simul_load_ratio: 2.0          # RM3 정하중 채널 1σ / 자체 노이즈 1σ
-  creep_pct_per_30s: 2
-  direction_spread_pct: 10
+  # v2 (오차는 모두 N)
+  error_max_N: 1.0               # 누름 1회의 |센서 |F| − 게이지| 최대
+  repeat_std_N: 0.3              # 같은 세기 단계에서 반복 간 오차 1σ 최대
+  site_diff_N: 1.0               # 위치·방향별 오차 − 정점 오차 (같은 힘에서) 최대
+  session_std_N: 0.3             # 같은 힘에서 세션별 평균 오차의 1σ (R1·R4 세션끼리, 최대)
+  multi_diff_N: 0.3              # 다중 연결·동시 하중 오차 − 단일(R1) 오차 (같은 힘에서) 최대
+  plate_error_max_N: 2.0         # RM5 누름 1회의 | |ΣF| − 게이지 | 최대 (4개 합이라 단일 기준 1.0 N × √4)
+  zero_residual_N: 0.1           # 뗀 뒤 rest_s 끝의 잔류 |ΔF| (누르기 전 대비)
+  zero_recovery_s: 3             # 뗀 뒤 잔류가 위 기준 안으로 들어오는 시간 (= press.rest_s)
   noise_std_N: 0.02
-  # v1 과 공용
+  channel_crosstalk_N: 0.1       # 다른 센서를 누를 때 무하중 채널 변화
+  simul_load_ratio: 2.0          # RM3 정하중 채널 1σ / 자체 노이즈 1σ
+  alignment_ratio_max: 1.05      # |F|/게이지 (라이브 정렬 타일, 리포트 경고)
+  frame_drop_pct: 0.1
+  min_rate_ratio: 0.9
+  # v1 (S/M 테스트 전용)
+  slope_tol: 0.03
   nonlinearity_pct_fs: 3
   hysteresis_pct_fs: 3
   repeatability_pct_fs: 1
   position_spread_pct: 10
   crosstalk_pct: 5
-  zero_residual_N: 0.1
-  zero_recovery_s: 5
   low_force_error_pct: 5
   low_force_error_min_N: 0.1
-  channel_crosstalk_N: 0.1
   multi_slope_diff_pct: 1
-  multi_delta_pct_fs: 1       # 같은 기준 하중(50 % F.S.)에서 읽음 차이
-  multi_offset_diff_N: 0.1    # 절편 차이 (참고 지표. 판정은 위 항목으로)
-  frame_drop_pct: 0.1
-  min_rate_ratio: 0.9
+  multi_offset_diff_N: 0.1
 
 # ── 시간 동기 ─────────────────────────────────────────────────────
 sync:
@@ -162,6 +174,7 @@ sync:
 sim:
   seed: 7
   gauge_noise_N: 0.05
+  gauge_rate_hz: 10          # 실측 게이지 스트림과 같게
   pxsr_clock_offset_s: 0.12   # PXSR 타임스탬프가 실제보다 늦게 찍히는 상황 재현
   latency_s: 0.02
   operator_ramp_s: 1.2

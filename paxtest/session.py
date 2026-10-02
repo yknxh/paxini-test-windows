@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from . import __version__
-from .analysis import contacts as C
+from .analysis import presses as PR
 from .config import Config, SensorInfo
 from .devices.pxsr import import_session_files
 from .procedures import Step, TestDef
@@ -167,10 +167,11 @@ class SessionRunner:
         self.measure_t0 = 0.0
         self.on_finished: Optional[Callable[[str], None]] = None
         self.message = ""
-        # v2 자유 스윕: 라이브 커버리지 (GUI 표시 + 자동 진행 판단에 공용)
-        self.detect_params = C.params(proc.get("v2") or {}, float(recorder.options.get("quick", 1.0)))
-        self.coverage: Dict = {"rows": [], "done": False, "bin_s": [], "counts": {}, "n_events": 0}
-        self._cov_t = 0.0
+        # v2 누름 블록: 게이지로 유지·쉬기를 판정해 조작자에게 다음 동작을 알린다
+        self.press_params = PR.params(proc.get("v2") or {}, float(recorder.options.get("quick", 1.0)))
+        self.tracker: Optional[PR.PressTracker] = None
+        self._trk_t = 0.0
+        self._sim_done_t = 0.0
 
     # ── 조회 ──
     @property
@@ -186,28 +187,22 @@ class SessionRunner:
         return self.phase in ("prepare", "measure")
 
     @property
-    def free_steps(self) -> List[int]:
-        return [k for k, s in enumerate(self.steps) if s.kind == "free"]
-
-    @property
-    def in_free(self) -> bool:
-        return self.phase == "measure" and self.step is not None and self.step.kind == "free"
+    def in_press(self) -> bool:
+        return (self.phase == "measure" and self.step is not None and self.step.kind == "press"
+                and self.tracker is not None)
 
     def measure_progress(self) -> float:
         if self.phase != "measure" or not self.step or self.step.duration_s <= 0:
             return 0.0
-        if self.step.open_ended:      # 자유 구간은 커버리지 달성률을 진행률로 쓴다
-            rows = self.coverage.get("rows") or []
-            if not rows:
-                return 0.0
-            return float(np.mean([min(1.0, r["have"] / max(1, r["need"])) for r in rows]))
+        if self.step.open_ended:      # 누름 블록은 끝낸 누름 수를 진행률로 쓴다
+            return self.tracker.progress() if self.tracker else 0.0
         return min(1.0, (time.time() - self.measure_t0) / self.step.duration_s)
 
     def remaining_s(self, prepare_s: float = 6.0) -> float:
         rest = 0.0
         for k, s in enumerate(self.steps[max(self.i, 0):], start=max(self.i, 0)):
             if k == self.i and self.phase == "measure":
-                rest += max(0.0, s.duration_s - (time.time() - self.measure_t0))   # 자유 구간은 예상치
+                rest += max(0.0, s.duration_s - (time.time() - self.measure_t0))   # 누름 블록은 예상치
             else:
                 rest += s.duration_s + (prepare_s if s.kind != "instruction" else 3.0)
         return rest
@@ -250,11 +245,8 @@ class SessionRunner:
         if s is None:
             return
         if self.phase == "measure":
-            if s.kind == "free":        # 자유 구간 종료
-                self.rec.log_event(self.i, s, self.measure_t0, time.time(), "ok")
-                log.info("구간 '%s' 종료 (%s)", s.label or s.title,
-                         "커버리지 충족" if self.coverage.get("done") else "조작자 종료")
-                self._enter(self.i + 1)
+            if s.kind == "press":       # 누름 블록을 일찍 끝냄 (남은 누름 생략)
+                self._end_press("조작자 종료")
             return
         if self.phase != "prepare":
             return
@@ -265,8 +257,9 @@ class SessionRunner:
             return
         self.phase = "measure"
         self.measure_t0 = now
-        self.coverage = {"rows": [], "done": False, "bin_s": [], "counts": {}, "n_events": 0}
-        self._cov_t = 0.0
+        self.tracker = (PR.PressTracker(s.tags.get("targets") or [], self.press_params)
+                        if s.kind == "press" else None)
+        self._trk_t = 0.0
         if self.hub.sim_operator:
             self.hub.sim_operator.on_measure(s, self.dut_ids)
 
@@ -284,36 +277,30 @@ class SessionRunner:
             log.info("단계 %d 로 되돌아감 (이전 기록은 새 측정으로 대체)", k + 1)
             self._enter(k)
 
-    def goto_free(self, n: int) -> bool:
-        """n 번째(1-base) 자유 구간으로 이동. 측정 중이면 현재 구간을 저장하고 넘어간다."""
-        idx = self.free_steps
-        if not (1 <= n <= len(idx)) or not self.active:
-            return False
-        target = idx[n - 1]
-        if self.phase == "measure" and self.step is not None:
-            status = "ok" if self.step.kind == "free" else "discarded"
-            self.rec.log_event(self.i, self.step, self.measure_t0, time.time(), status)
-        log.info("구간 %d 로 이동: %s", n, self.steps[target].title)
-        self._enter(target)
-        return True
-
-    def update_coverage(self, force: bool = False) -> None:
-        """자유 구간에서 게이지 스트림으로 이벤트를 세어 커버리지를 갱신 (0.5초마다)."""
-        s = self.step
-        if not self.in_free or self.hub.gauge is None:
+    def update_press(self) -> None:
+        """누름 블록: 게이지 스트림으로 유지·쉬기를 판정하고, 다 끝나면 다음 단계로 (0.1초마다)."""
+        if not self.in_press or self.hub.gauge is None:
             return
         now = time.time()
-        if not force and now - self._cov_t < 0.5:
+        if now - self._trk_t < 0.1:
             return
-        self._cov_t = now
-        sid = (s.sensors or self.dut_ids)[0]
+        self._trk_t = now
+        tr = self.tracker
+        before = (tr.i, tr.state)
         t, v = self.hub.gauge.buffer.snapshot(since=self.measure_t0)
-        try:
-            self.coverage = C.summarize(t, v[:, 0] if len(v) else np.empty(0),
-                                        self.fs.get(sid, 50.0), self.detect_params,
-                                        s.tags.get("coverage") or {})
-        except Exception:
-            log.exception("커버리지 계산 실패")
+        tr.update(t, v[:, 0] if len(v) else np.empty(0))
+        if (tr.i, tr.state) != before and tr.state == "release":
+            log.info("누름 %d/%d 유지 완료 (%.1f N)", tr.i + 1, len(tr.targets), tr.level)
+        if tr.done:
+            self._end_press("완료")
+
+    def _end_press(self, why: str) -> None:
+        s = self.step
+        n = self.tracker.i if self.tracker else 0
+        self.rec.log_event(self.i, s, self.measure_t0, time.time(), "ok")
+        log.info("누름 블록 '%s' 종료 (%s, %d/%d회)", s.label or s.title, why, n, len(s.tags.get("targets") or []))
+        self.tracker = None
+        self._enter(self.i + 1)
 
     def marker(self, note: str = "") -> None:
         now = time.time()
@@ -342,13 +329,14 @@ class SessionRunner:
                 if settled:
                     self.confirm()
         elif self.phase == "measure":
-            if s.kind == "free":
-                self.update_coverage()
-                if self.auto_confirm:
-                    done = (self.hub.sim_operator.program_done() if self.hub.sim_operator is not None
-                            else self.coverage.get("done", False))
-                    if done:
+            if s.kind == "press":
+                self.update_press()
+                sim = self.hub.sim_operator
+                if self.auto_confirm and sim is not None and sim.program_done() and self.in_press:
+                    if now - self._sim_done_t > 2.0:      # 가상 조작자가 끝났는데 한 번이 안 세어진 경우
                         self.confirm()
+                else:
+                    self._sim_done_t = now
             elif now - self.measure_t0 >= s.duration_s:
                 self.rec.log_event(self.i, s, self.measure_t0, now, "ok")
                 self._enter(self.i + 1)

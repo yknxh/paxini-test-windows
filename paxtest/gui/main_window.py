@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..analysis import plots as P
-from ..analysis.contacts import KIND_LABEL
 from ..analysis.pipeline import V2_CODES, analyze_session, compare_report, list_sessions
 from ..config import Config, SensorInfo
 from ..devices.hub import DeviceHub
@@ -126,8 +125,6 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_R), self, activated=self._on_redo)
         QShortcut(QKeySequence(Qt.Key_M), self, activated=self._on_marker)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._on_abort)
-        for n in range(1, 10):   # 1~9 = n 번째 자유 구간으로 (위치·방향 다시 하기)
-            QShortcut(QKeySequence(str(n)), self, activated=lambda k=n: self._on_goto(k))
 
     def _build_left(self) -> QWidget:
         w = QWidget()
@@ -299,14 +296,14 @@ class MainWindow(QMainWindow):
                   self.tile_ratio, self.tile_dir):
             trow.addWidget(t)
         v.addLayout(trow)
-        self.cov_box = self._build_coverage()
-        v.addWidget(self.cov_box)
+        self.press_box = self._build_press_panel()
+        v.addWidget(self.press_box)
 
         pg.setConfigOptions(antialias=True, background=S.SURFACE, foreground=S.INK2)
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.15)
-        self.plot.setLabel("bottom", "시간 (s, 0 = 현재)")
-        self.plot.setLabel("left", "힘 (N)")
+        self.plot.setLabel("bottom", "Time (s, 0 = now)")
+        self.plot.setLabel("left", "Force (N)")
         self.plot.setXRange(-WINDOW_S, 0, padding=0)
         self.plot.addLegend(offset=(10, 10))
         self.gauge_curve = self.plot.plot([], [], pen=pg.mkPen(S.INK2, width=2, style=Qt.DashLine),
@@ -350,61 +347,57 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(res, "결과")
         return self.tabs
 
-    def _build_coverage(self) -> QWidget:
-        """자유 스윕 구간의 라이브 커버리지 (test-plan-v2.md §4·§6)."""
-        g = QGroupBox("커버리지 — 목표가 모두 차면 [Space] 로 구간 종료")
+    def _build_press_panel(self) -> QWidget:
+        """누름 블록 안내 (test-plan-v2.md §4): 지금 할 동작, 유지·쉬기 타이머, 누름 진행."""
+        g = QGroupBox("누름 안내 — 누르고 유지 → 떼고 쉬기 (게이지로 자동 판정)")
         v = QVBoxLayout(g)
         v.setContentsMargins(12, 6, 12, 8)
-        self.cov_row = QHBoxLayout()
-        self.cov_labels: Dict[str, QLabel] = {}
-        v.addLayout(self.cov_row)
-        self.cov_bins = QLabel()
-        self.cov_bins.setTextFormat(Qt.RichText)
-        self.cov_bins.setToolTip("게이지 0→100 % F.S. 를 10 % 씩 나눈 구간별 준정적 체류 시간")
-        v.addWidget(self.cov_bins)
-        self.cov_state = QLabel()
-        self.cov_state.setWordWrap(True)
-        v.addWidget(self.cov_state)
+        self.press_cue = QLabel()
+        self.press_cue.setAlignment(Qt.AlignCenter)
+        self.press_cue.setTextFormat(Qt.RichText)
+        v.addWidget(self.press_cue)
+        self.press_seq = QLabel()
+        self.press_seq.setTextFormat(Qt.RichText)
+        self.press_seq.setWordWrap(True)
+        v.addWidget(self.press_seq)
         g.setVisible(False)
         return g
 
-    def _update_coverage_panel(self) -> None:
+    def _update_press_panel(self) -> None:
         r = self.runner
-        show = bool(r and r.in_free)
-        self.cov_box.setVisible(show)
+        show = bool(r and r.in_press)
+        self.press_box.setVisible(show)
         if not show:
             return
-        cov = r.coverage
-        rows = cov.get("rows") or []
-        while self.cov_row.count() > len(rows):
-            it = self.cov_row.takeAt(self.cov_row.count() - 1)
-            if it.widget():
-                it.widget().deleteLater()
-        while self.cov_row.count() < len(rows):
-            lab = QLabel()
-            lab.setAlignment(Qt.AlignCenter)
-            self.cov_row.addWidget(lab)
-        for i, row in enumerate(rows):
-            w = self.cov_row.itemAt(i).widget()
-            col = S.GOOD if row["ok"] else S.INK
-            w.setText(f"<div style='font-size:12px;color:{S.MUTED}'>{row['label']}</div>"
-                      f"<div style='font-size:20px;font-weight:700;color:{col}'>"
-                      f"{row['have']}<span style='font-size:13px;color:{S.MUTED}'> / {row['need']}</span>"
-                      f"{' ✓' if row['ok'] else ''}</div>")
-        bs = cov.get("bin_s") or []
-        need = float(cov.get("bin_min_s", 1.0))
-        cells = []
-        for i, sec in enumerate(bs):
-            frac = min(1.0, sec / need) if need > 0 else 0.0
-            c = S.GOOD if frac >= 1 else (S.BLUE if frac > 0.3 else S.LINE)
-            cells.append(f"<span style='background:{c};color:white;padding:2px 7px;margin-right:2px;"
-                         f"border-radius:3px;font-size:11px'>{i * 10}</span>")
-        self.cov_bins.setText("구간 채움 (% F.S.): " + "".join(cells))
-        if cov.get("done"):
-            self.cov_state.setText(f"<b style='color:{S.GOOD}'>목표 충족 — [Space] 로 구간을 끝내세요</b>")
+        tr = r.tracker
+        p = tr.p
+        tgt = tr.target
+        big = "font-size:26px;font-weight:800"
+        if tr.state == "press":
+            if tr.hold_s > 0.2:
+                cue = (f"<span style='{big};color:{S.GOOD}'>유지  {tr.hold_s:.1f} / {p['hold_s']:g} s</span>"
+                       f"<span style='font-size:15px;color:{S.MUTED}'>   ({_n(tr.level)} N, 안내 {tgt:g} N)</span>")
+            else:
+                cue = f"<span style='{big};color:{S.BLUE}'>누르세요  → 약 {tgt:g} N</span>"
+        elif tr.state == "release":
+            cue = f"<span style='{big};color:{S.CRIT}'>떼세요</span>"
+        elif tr.state == "rest":
+            cue = (f"<span style='{big};color:{S.MUTED}'>쉬기 (손대지 않기)  {tr.rest_s:.1f} / {p['rest_s']:g} s</span>")
         else:
-            miss = ", ".join(f"{x['label']} {x['need'] - x['have']}회 더" for x in rows if not x["ok"])
-            self.cov_state.setText(f"<span style='color:{S.MUTED}'>남은 것: {miss or '–'}</span>")
+            cue = f"<span style='{big};color:{S.GOOD}'>완료</span>"
+        self.press_cue.setText(cue)
+        cells = []
+        for k, t in enumerate(tr.targets):
+            if k < tr.i:
+                c, fg = S.GOOD, "white"
+            elif k == tr.i:
+                c, fg = S.BLUE, "white"
+            else:
+                c, fg = S.LINE, S.INK2
+            cells.append(f"<span style='background:{c};color:{fg};padding:2px 7px;margin-right:3px;"
+                         f"border-radius:3px;font-size:12px'>{t:g}</span>")
+        self.press_seq.setText(f"누름 {min(tr.i + 1, len(tr.targets))} / {len(tr.targets)} (안내 세기 N): "
+                               + "".join(cells))
 
     def _build_right(self) -> QWidget:
         w = QWidget()
@@ -507,6 +500,15 @@ class MainWindow(QMainWindow):
         t = self.current_test()
         sensors = self.selected_sensors()
         quick = self.sp_quick.value()
+        if not self.hub.gauge_receiving():
+            state, info = self.hub.status_summary()["gauge"]
+            if QMessageBox.warning(self, "게이지 값 없음",
+                                   f"게이지 값이 들어오지 않고 있습니다 ({state}: {info}).\n"
+                                   "이대로 시작하면 누름 판정과 오차 계산이 되지 않습니다.\n\n"
+                                   "게이지 전원, 데이터 출력(RS-232) 설정, 게이지 쪽 케이블을 확인하세요.\n"
+                                   "그래도 시작할까요?",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
         if not self.sim and quick < 1.0:
             if QMessageBox.question(self, "시간 배율", f"시간 배율이 {quick:g} 입니다 (리허설용). 계속할까요?") \
                     != QMessageBox.Yes:
@@ -536,24 +538,33 @@ class MainWindow(QMainWindow):
     # ═════════════════════════ 조작 ═════════════════════════
     def _on_primary(self) -> None:
         if self.runner and self.runner.active:
-            self.runner.confirm()
+            if self.runner.in_press:
+                self._end_press_early()
+            else:
+                self.runner.confirm()
         else:
             self._on_start()
 
     def _on_confirm(self) -> None:
         if self.runner and self.runner.active:
+            if self.runner.in_press:        # 누름 블록 중 [Space] 는 무시 (습관적으로 눌러 블록이 끝나지 않게)
+                return
             self._ratio_min = 9.9
             self.runner.confirm()
+
+    def _end_press_early(self) -> None:
+        r = self.runner
+        if not (r and r.in_press):
+            return
+        left = len(r.tracker.targets) - r.tracker.i
+        if QMessageBox.question(self, "블록 조기 종료", f"남은 누름 {left}회를 생략하고 다음 단계로 갈까요?") \
+                == QMessageBox.Yes:
+            r.confirm()
 
     def _on_redo(self) -> None:
         if self.runner and self.runner.active:
             self._ratio_min = 9.9
             self.runner.redo()
-
-    def _on_goto(self, n: int) -> None:
-        if self.runner and self.runner.active and self.runner.free_steps:
-            if self.runner.goto_free(n):
-                self._ratio_min = 9.9
 
     def _on_marker(self) -> None:
         if not (self.runner and self.runner.active):
@@ -579,8 +590,8 @@ class MainWindow(QMainWindow):
             self._ratio_min = 9.9
         self._update_live()
         self._update_step_card()
-        if self._tick_n % 6 == 0:
-            self._update_coverage_panel()
+        if self._tick_n % 3 == 0:
+            self._update_press_panel()
         if self._tick_n % 2 == 0:
             self._update_camera()
         if self._tick_n % 12 == 0:
@@ -690,14 +701,17 @@ class MainWindow(QMainWindow):
         step = self.runner.step if self.runner and self.runner.active else None
         if step is not None and step.target_N:
             top = max(top, step.target_N)
-        if step is not None and step.kind == "free":
-            top = max(top, self._prim_fs(self._primary_sensor()))
+        if step is not None and step.kind == "press":
+            top = max([top] + list(step.tags.get("targets") or []))
         self.plot.setYRange(bot, top * 1.08, padding=0)
-        if step is not None and step.kind == "free":
+        tr = self.runner.tracker if step is not None and self.runner.in_press else None
+        if tr is not None and tr.target is not None:
+            self.target_line.setValue(tr.target)
+            self.target_line.setVisible(True)
+            self.tile_target.set(f"약 {tr.target:g} N  ({tr.i + 1}/{len(tr.targets)})", S.BLUE)
+        elif step is not None and step.kind == "press":
             self.target_line.setVisible(False)
-            idx = self.runner.free_steps
-            n = idx.index(self.runner.i) + 1 if self.runner.i in idx else 0
-            self.tile_target.set(f"{step.label or step.title}  ({n}/{len(idx)})", S.BLUE)
+            self.tile_target.set(f"{step.label or step.title}", S.BLUE)
         elif step is not None and step.target_N is not None and step.kind == "hold":
             self.target_line.setValue(step.target_N)
             self.target_line.setVisible(True)
@@ -758,33 +772,28 @@ class MainWindow(QMainWindow):
         if r.phase == "prepare":
             if s.kind == "instruction":
                 self._set_phase("안내 — [Space] 확인", S.BLUE)
-            elif s.kind == "free":
-                self._set_phase("정렬 — |F|÷게이지 가 최소가 되는 각도로 맞춘 뒤 [Space]", S.BLUE)
+            elif s.kind == "press":
+                self._set_phase("정렬 — |F|÷게이지 가 최소가 되는 각도로 맞춘 뒤 떼고 [Space] → 누름 시작", S.BLUE)
             elif s.kind == "hold":
                 auto = r.auto_confirm and s.reference == "gauge"
                 self._set_phase("준비 — 하중을 맞추세요" + (" (안정되면 자동 시작)" if auto else " → [Space]"), S.BLUE)
             else:
                 self._set_phase(f"준비 — [Space] 누르면 {s.duration_s:g}초 기록 시작", S.BLUE)
             self.pb_measure.setValue(0)
-        elif s.kind == "free":
-            el = time.time() - r.measure_t0
-            done = r.coverage.get("done")
-            self._set_phase(f"● 스윕 기록 중  {_fmt_dur(el)}  ·  "
-                            + ("커버리지 충족 — [Space] 로 다음 구간" if done else "[Space] = 구간 종료"),
-                            S.GOOD if done else S.CRIT)
+        elif s.kind == "press" and r.tracker is not None:
+            tr = r.tracker
+            self._set_phase(f"● 누름 블록  {min(tr.i + 1, len(tr.targets))}/{len(tr.targets)}  ·  "
+                            f"{tr.CUE[tr.state]}  (다 끝나면 자동으로 다음 단계)", S.CRIT)
             self.pb_measure.setValue(int(r.measure_progress() * 1000))
         else:
             el = time.time() - r.measure_t0
             self._set_phase(f"● 측정 중  {el:4.1f} / {s.duration_s:g} s", S.CRIT)
             self.pb_measure.setValue(int(r.measure_progress() * 1000))
         nx = r.next_step
-        hint = ""
-        if len(r.free_steps) > 1:
-            hint = "   ·   [1]~[9] 로 구간 다시 하기"
+        hint = "   ·   [R] 로 이 블록 처음부터 다시" if s.kind == "press" and r.phase == "measure" else ""
         self.lb_next.setText((f"다음: {nx.title}" if nx else "다음: 종료 → 자동 분석") + hint)
-        self.btn_confirm.setText("구간 종료 / 다음   [Space]" if s.kind == "free" and r.phase == "measure"
-                                 else "확인 / 다음   [Space]")
-        self.btn_confirm.setEnabled(r.phase == "prepare" or s.kind == "free")
+        self.btn_confirm.setText("블록 조기 종료 (남은 누름 생략)" if r.in_press else "확인 / 다음   [Space]")
+        self.btn_confirm.setEnabled(r.phase == "prepare" or r.in_press)
         for b in (self.btn_redo, self.btn_marker, self.btn_abort):
             b.setEnabled(True)
         self.btn_report.setEnabled(False)
@@ -796,9 +805,10 @@ class MainWindow(QMainWindow):
     def _update_status(self) -> None:
         st = self.hub.status_summary()
         colors = {"connected": S.GOOD, "live": S.GOOD, "waiting": S.WARN, "error": S.CRIT, "no_dir": S.CRIT,
-                  "disconnected": S.MUTED, "disabled": S.MUTED}
+                  "disconnected": S.MUTED, "disabled": S.MUTED, "no_data": S.CRIT}
         names = {"connected": "연결됨", "live": "실시간 수신", "waiting": "대기 (파일 없음/정지)",
-                 "error": "오류", "no_dir": "폴더 없음", "disconnected": "끊김", "disabled": "사용 안 함"}
+                 "error": "오류", "no_dir": "폴더 없음", "disconnected": "끊김", "disabled": "사용 안 함",
+                 "no_data": "수신 없음"}
         for key, (state, info) in st.items():
             self.st_labels[key].setText(f"<span style='color:{colors.get(state, S.MUTED)}'>●</span> "
                                         f"{names.get(state, state)} <span style='color:{S.MUTED}'>{info}</span>")
@@ -827,10 +837,10 @@ class MainWindow(QMainWindow):
         if r and r.active and r.step:
             s = r.step
             ph = "MEASURE" if r.phase == "measure" else "prep"
-            if s.kind == "free":
-                cov = r.coverage.get("counts", {})
-                cnt = " ".join(f"{k[0].upper()}{cov.get(k, 0)}" for k in ("ramp", "pulse", "hold", "step"))
-                lines.append(f"{r.rec.test.code} seg {s.label or s.title} [{ph}] {cnt}")
+            if r.in_press:
+                tr = r.tracker
+                lines.append(f"{r.rec.test.code} {P.en(s.label or s.title)} press {min(tr.i + 1, len(tr.targets))}/"
+                             f"{len(tr.targets)} {tr.state} target {tr.target or 0:g}N")
             else:
                 tgt = f" target {s.target_N:.1f}N" if s.target_N is not None else ""
                 lines.append(f"{r.rec.test.code} step {r.i + 1}/{len(r.steps)} [{ph}]{tgt}")

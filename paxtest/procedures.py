@@ -1,15 +1,15 @@
 """테스트 케이스를 단계(Step) 목록으로 만든다.
 
-v2 (test-plan-v2.md · R0~R3, RM1~RM4) : 목표값을 맞추지 않는 자유 스윕.
+v2 (test-plan-v2.md · R0~R4, RM1~RM4) : 고정 행동강령의 누름 블록 (누르고 3초 유지 → 떼고 3초 쉬기).
 v1 (이전 방식      · S1~S9, M1~M7)    : 목표값 계단. 분동 등 정적 방식이 필요할 때 사용.
 
 단계 종류(kind)
 - instruction : 안내만. 확인을 누르면 다음 단계로.
 - hold        : 하중을 맞춘 뒤 확인 → duration 동안 유지하며 측정. (v1)
 - record      : 확인 → duration 동안 기록 (탭, 스텝 입력, 해제, 무하중 기록 등).
-- free        : 길이가 정해지지 않은 자유 스윕 구간. 커버리지가 차면 [Space] 로 종료. (v2)
+- press       : 누름 블록. 안내 세기로 누르고 유지 → 떼고 쉬기를 반복. 유지·쉬기는 게이지로 자동 판정. (v2)
 
-action 은 분석과 가상 조작자가 쓰는 의미 태그: load | zero | tap | step | release | sweep
+action 은 분석과 가상 조작자가 쓰는 의미 태그: load | zero | tap | step | release | press | fast
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class Step:
     @property
     def open_ended(self) -> bool:
         """길이가 정해지지 않은 구간 (duration_s 는 예상 시간일 뿐)."""
-        return self.kind == "free"
+        return self.kind == "press"
 
     @property
     def label(self) -> str:
@@ -70,9 +70,6 @@ class BuildContext:
     def v2get(self, key: str, default):
         v = self.v2.get(key, default)
         return default if v is None else v
-
-    def coverage(self, group: str) -> Dict:
-        return dict((self.v2.get("coverage") or {}).get(group) or {})
 
 
 @dataclass
@@ -310,29 +307,57 @@ def build_m7(ctx):
                         {"n_connected": len(ctx.sensors), "composition": comp})
 
 
-# ══════════════════════════ v2 · 자유 스윕 ══════════════════════════
-# test-plan-v2.md §4. 목표값을 맞추지 않는다. 라이브 커버리지가 차면 구간을 끝낸다.
+# ══════════════════════════ v2 · 누름 블록 ══════════════════════════
+# test-plan-v2.md §4. 행동강령을 고정한다: 안내 세기로 누르고 3초 유지 → 떼고 3초 쉬기.
+# 세기는 대략이면 된다(실제 값은 게이지가 기록). 유지·쉬기 판정은 게이지로 자동.
 
-COVER_HINT = {"ramp": "램프(0→거의 F.S.→0, 각 방향 10초 이상 천천히)",
-              "pulse": "펄스(대충 20~70 %로 눌렀다 떼기, 1~3초)",
-              "hold": "홀드(약 50 %로 30초 이상 유지 후 빠르게 해제 · 스탠드 락)",
-              "step": "스텝(최대한 빠르게 30~50 %까지 → 3초 유지 → 빠르게 해제)"}
-
-
-def _cover_detail(cov: Dict) -> str:
-    lines = [f"· {COVER_HINT[k]} × {cov[k]}회" for k in ("ramp", "pulse", "hold", "step") if cov.get(k)]
-    if cov.get("bins"):
-        lines.append(f"· 비어 있는 10 % 구간에서 {cov.get('bin_s', 1):g}초씩 멈추기 (커버리지 막대 참고)")
-    return "\n".join(lines)
+def _press_cfg(ctx: BuildContext) -> Dict:
+    return ctx.v2.get("press") or {}
 
 
-def free_step(ctx: BuildContext, title: str, sensor: str, *, label: str, site: str, group: str,
-              est_s: float, detail: str = "", **tags) -> Step:
-    cov = ctx.coverage(group)
-    body = detail or "게이지 팁을 접촉점에 대고 |F|/게이지 비율이 최소가 되는 각도(법선)로 맞춘 뒤 [Space]"
-    return Step("free", title, detail=f"{body}\n{_cover_detail(cov)}", duration_s=ctx.dur(est_s),
-                sensors=[sensor], action="sweep", reference="gauge",
-                tags={"label": label, "site": site, "group": group, "coverage": cov, **tags})
+def _levels(ctx: BuildContext, group: str) -> List[float]:
+    return [float(x) for x in ((_press_cfg(ctx).get("levels_pct") or {}).get(group) or [30, 60, 90])]
+
+
+def _reps(ctx: BuildContext, group: str) -> int:
+    return int((_press_cfg(ctx).get("reps") or {}).get(group) or 2)
+
+
+def _press_s(ctx: BuildContext) -> float:
+    """누름 1회 예상 시간 (누르기 + 유지 + 떼기 + 쉬기)."""
+    c = _press_cfg(ctx)
+    return ctx.dur(float(c.get("hold_s", 3))) + ctx.dur(float(c.get("rest_s", 3))) + 2.5
+
+
+def _half(x: float) -> float:
+    return round(x * 2) / 2
+
+
+def press_step(ctx: BuildContext, title: str, sensor: SensorInfo, *, label: str, site: str, group: str,
+               detail: str = "", fs: Optional[float] = None, **tags) -> Step:
+    """누름 블록: 단계(세기) × 반복. 안내 순서는 낮은 세기부터, 반복마다 처음부터 다시.
+    fs 를 주면 안내 세기(%)의 기준을 바꾼다 (판 누름: 센서 정격의 합)."""
+    levels = _levels(ctx, group)
+    fs = sensor.rated_N if fs is None else fs
+    targets = [_half(pct / 100 * fs) for _ in range(_reps(ctx, group)) for pct in levels]
+    c = _press_cfg(ctx)
+    rule = (f"행동강령: 안내 세기로 누름 → {float(c.get('hold_s', 3)):g}초 유지 (게이지가 안정되면 자동으로 셈) → "
+            f"떼기 → {float(c.get('rest_s', 3)):g}초 손대지 않기. 세기는 대략이면 됩니다")
+    return Step("press", title, detail=f"{detail}\n{rule}" if detail else rule,
+                duration_s=len(targets) * _press_s(ctx), sensors=[sensor.id], action="press", reference="gauge",
+                tags={"label": label, "site": site, "group": group, "targets": targets,
+                      "levels_N": sorted({_half(pct / 100 * fs) for pct in levels}), **tags})
+
+
+def fast_step(ctx: BuildContext, sensor: SensorInfo) -> Step:
+    fast = ctx.v2.get("fast") or {}
+    taps, rel = int(fast.get("taps", 5)), int(fast.get("releases", 5))
+    return Step("record", "빠른 입력 (응답 시간)",
+                detail=(f"[Space] 후 {sensor.id} 정점을\n① 딱딱한 물체로 짧고 빠르게 톡 × {taps}회 (1초 간격)\n"
+                        f"② 절반쯤 눌렀다가 한 번에 떼기 × {rel}회 (떼고 2초 쉬기)\n"
+                        "입력이 빠를수록 센서 자체의 응답 시간이 드러납니다. 게이지와는 비교하지 않습니다"),
+                duration_s=max(10.0, ctx.dur(float(fast.get("record_s", 40)))), sensors=[sensor.id], action="fast",
+                reference="none", tags={"taps": taps, "releases": rel})
 
 
 def v2_prefix(ctx: BuildContext, tap_sensor: Optional[str] = None, with_tap: bool = True) -> List[Step]:
@@ -342,7 +367,7 @@ def v2_prefix(ctx: BuildContext, tap_sensor: Optional[str] = None, with_tap: boo
                   detail=(f"① 센서 {ids} 장착, 10분 웜업\n② PXSR 영점 캘리브레이션 (무하중 ±0.02 N)\n"
                           f"③ 게이지 ZERO · {tip} 장착\n④ PXSR 기록 시작\n모두 끝나면 [확인]")),
              Step("record", "무하중 기록", detail="아무것도 닿지 않게 두고 [Space]", target_N=0.0,
-                  duration_s=ctx.dur(float(ctx.v2get("head_zero_s", 20))), action="zero",
+                  duration_s=ctx.dur(float(ctx.v2get("head_zero_s", 15))), action="zero",
                   sensors=[s.id for s in ctx.sensors])]
     if with_tap:
         tap = tap_sensor or ctx.dut.id
@@ -357,7 +382,7 @@ def v2_suffix(ctx: BuildContext, tail_zero: bool = True) -> List[Step]:
     steps = []
     if tail_zero:
         steps.append(Step("record", "무하중 기록 (영점 복귀)", detail="하중을 모두 제거한 뒤 [Space]",
-                          target_N=0.0, duration_s=ctx.dur(float(ctx.v2get("tail_zero_s", 30))), action="zero",
+                          target_N=0.0, duration_s=ctx.dur(float(ctx.v2get("tail_zero_s", 15))), action="zero",
                           sensors=[s.id for s in ctx.sensors]))
     steps.append(Step("instruction", "PXSR 기록 정지", detail="PXSR 에서 기록을 정지·저장한 뒤 [확인]",
                       reference="none"))
@@ -369,28 +394,30 @@ def build_r0(ctx):
     return [Step("instruction", "준비 확인", reference="none",
                  detail=f"센서 {s.id} 장착·웜업·PXSR 영점 후 기록 시작. 접촉 없이 그대로 두세요"),
             Step("record", "무하중 기록 (정지)", detail="테이블 진동도 주지 않도록 손을 떼고 [Space]",
-                 target_N=0.0, duration_s=ctx.dur(float(ctx.v2get("r0_zero_s", 90))), action="zero",
+                 target_N=0.0, duration_s=ctx.dur(float(ctx.v2get("r0_zero_s", 15))), action="zero",
                  sensors=[s.id])] + v2_suffix(ctx, tail_zero=False)
 
 
 def build_r1(ctx):
     s = ctx.dut
     steps = v2_prefix(ctx)
-    steps.append(free_step(ctx, "정점 스윕", s.id, label="정점", site="pos:apex", group="apex", est_s=420,
-                           detail=(f"정점(법선 = z)에 {s.ball_tip}. 스탠드로 각도를 조금씩 바꿔 "
-                                   "|F|/게이지 비율이 최소가 되는 지점에 맞추고, 그 각도를 유지한 채:")))
+    steps.append(press_step(ctx, "정점 누름", s, label="정점", site="pos:apex", group="apex",
+                            detail=(f"정점(법선 = z)에 {s.ball_tip}. 스탠드로 |F|/게이지 비율이 최소가 되는 각도에 "
+                                    "맞춘 뒤 [Space]. 그 각도를 유지한 채 안내대로 누릅니다")))
+    steps.append(fast_step(ctx, s))
     return steps + v2_suffix(ctx)
 
 
 def build_r2(ctx):
     s = ctx.dut
     steps = v2_prefix(ctx)
-    for i, pos in enumerate(ctx.v2get("positions", ["정점", "+x", "-x", "+y", "-y"])):
-        site = "pos:apex" if i == 0 else f"pos:{pos}"
-        where = "정점" if i == 0 else f"정점에서 {pos} 방향으로 활성면 경계 가까이"
-        steps.append(free_step(ctx, f"위치 '{pos}'", s.id, label=pos, site=site, group="position", est_s=70,
-                               detail=(f"{s.ball_tip} 을 {where} 에 놓고, 이 위치에서 다시 "
-                                       "|F|/게이지 비율이 최소가 되는 각도로 정렬한 뒤:")))
+    for pos in ctx.v2get("positions", ["+x", "-x"]):
+        apex = pos == "정점"
+        site = "pos:apex" if apex else f"pos:{pos}"
+        where = "정점" if apex else f"정점에서 {pos} 방향으로 활성면 경계 가까이"
+        steps.append(press_step(ctx, f"위치 '{pos}'", s, label=pos, site=site, group="site",
+                                detail=(f"{s.ball_tip} 을 {where} 에 놓고 |F|/게이지 비율이 최소가 되는 각도로 "
+                                        "정렬한 뒤 [Space]")))
     return steps + v2_suffix(ctx)
 
 
@@ -401,16 +428,19 @@ def build_r3(ctx):
         steps.append(Step("instruction", f"지그를 {d} 면으로", reference="none",
                           detail=f"센서를 눕혀 법선이 {d} 에 가장 가까운 면이 스탠드 아래로 오게 고정",
                           tags={"site": f"dir:{d}"}))
-        steps.append(free_step(ctx, f"방향 '{d}'", s.id, label=d, site=f"dir:{d}", group="direction", est_s=70,
-                               detail=f"{d} 면을 법선 방향으로 누릅니다. 비율 최소 각도로 정렬한 뒤:"))
-    if ctx.v2get("shear", False):
-        for ax in ("x", "y"):
-            steps.append(Step("instruction", f"전단 {ax} 준비", reference="none",
-                              detail="접착 패드를 정점에 붙이고 게이지 후크를 연결. 수직력이 거의 0 이 되게"))
-            steps.append(free_step(ctx, f"전단 '{ax}'", s.id, label=f"전단 {ax}", site=f"shear:{ax}",
-                                   group="direction", est_s=60,
-                                   detail=f"{ax} 접선 방향으로 당깁니다:"))
+        steps.append(press_step(ctx, f"방향 '{d}'", s, label=d, site=f"dir:{d}", group="site",
+                                detail=f"{d} 면을 법선 방향으로. 비율 최소 각도로 정렬한 뒤 [Space]"))
     return steps + v2_suffix(ctx)
+
+
+def build_r4(ctx):
+    """세션 간 재현성: 짧은 정점 누름 블록. 재연결·재장착 후 따로 실행한 세션끼리 (R1 포함) 비교한다."""
+    s = ctx.dut
+    steps = v2_prefix(ctx)
+    steps.append(press_step(ctx, "정점 누름 (재현성)", s, label="정점", site="pos:apex", group="session",
+                            detail=("R1 과 다른 세션: 커넥터를 뺐다 꽂고 센서를 다시 장착한 뒤 (가능하면 다른 날) 실행. "
+                                    f"정점에 {s.ball_tip}, R1 과 같은 요령으로 정렬 후 [Space]")))
+    return steps + v2_suffix(ctx, tail_zero=False)
 
 
 def _hand_note(ctx) -> str:
@@ -425,56 +455,60 @@ def build_rm1(ctx):
     ids = ", ".join(s.id for s in ctx.sensors)
     types = sorted({s.type for s in ctx.sensors})
     comp = "+".join(f"{t}×{sum(1 for s in ctx.sensors if s.type == t)}" for t in types)
+    rm1_s = float(ctx.v2get("rm1_zero_s", 15))
     return [Step("instruction", "연결 확인", reference="none",
                  detail=(f"허브에 {_hand_note(ctx)} 연결 ({ids}), PXSR 에서 전 채널이 보이는지 확인 후 기록 시작.\n"
                          "연결 수 1 / 2 / 4 를 각각 한 번씩 (손별로) 반복하세요")),
-            Step("record", f"무하중 60초 기록 ({n}개 · {comp})", detail="무하중 유지", target_N=0.0,
-                 duration_s=ctx.dur(60), action="zero", sensors=[s.id for s in ctx.sensors],
+            Step("record", f"무하중 {rm1_s:g}초 기록 ({n}개 · {comp})", detail="무하중 유지", target_N=0.0,
+                 duration_s=ctx.dur(rm1_s), action="zero", sensors=[s.id for s in ctx.sensors],
                  tags={"n_connected": n, "composition": comp})] + v2_suffix(ctx, tail_zero=False)
 
 
 def build_rm2(ctx):
     steps = v2_prefix(ctx)
     for s in ctx.sensors:
-        steps.append(free_step(ctx, f"센서 {s.id} 정점 스윕", s.id, label=s.id, site="pos:apex", group="multi",
-                               est_s=95, n_connected=len(ctx.sensors),
-                               detail=(f"{len(ctx.sensors)}개 모두 연결된 상태로 {s.id} (CH{s.channel}) 만 "
-                                       f"{s.ball_tip} 으로 누릅니다. 나머지는 손대지 마세요:")))
+        steps.append(press_step(ctx, f"센서 {s.id} 정점 누름", s, label=s.id, site="pos:apex", group="multi",
+                                n_connected=len(ctx.sensors),
+                                detail=(f"{len(ctx.sensors)}개 모두 연결된 상태로 {s.id} (CH{s.channel}) 만 "
+                                        f"{s.ball_tip} 으로 누릅니다. 나머지는 손대지 마세요. 정렬 후 [Space]")))
     return steps + v2_suffix(ctx)
 
 
-def _rm3_pairs(ids: List[str], types: Dict[str, str]) -> List[tuple]:
-    """인접 2쌍 + 타입이 다른 1쌍."""
-    pairs = [(ids[0], ids[1])]
-    if len(ids) >= 3:
-        pairs.append((ids[1], ids[2]))
-    mixed = next(((a, b) for a in ids for b in ids if a != b and types.get(a) != types.get(b)), None)
-    if mixed and mixed not in pairs and (mixed[1], mixed[0]) not in pairs:
-        pairs.append(mixed)
-    return pairs
-
-
 def build_rm3(ctx):
-    ids = [s.id for s in ctx.sensors]
-    types = {s.id: s.type for s in ctx.sensors}
+    """동시 하중 (전체 파지 상황): 센서마다 차례로, 나머지 전부(한 손이면 3개)에 정하중을 건 채 그 센서를 누름 블록.
+    1개 정하중 + 1개 누름 쌍은 2026-09-30 제외."""
+    by_id = {s.id: s for s in ctx.sensors}
+    ids = list(by_id)
     hint = ctx.v2get("rm3_static_N_hint", 5)
     steps = v2_prefix(ctx)
-    for a, b in _rm3_pairs(ids, types):
-        steps.append(Step("instruction", f"{b} 에 정하중", reference="none",
-                          detail=(f"클램프 또는 분동으로 {b} 를 약 {hint:g} N 으로 눌러 고정합니다. "
-                                  "값은 정확하지 않아도 됩니다 (변하지 않기만 하면 됩니다)"),
-                          tags={"static": [b]}))
-        steps.append(free_step(ctx, f"{a} 스윕 ({b} 정하중)", a, label=f"{a}|{b}", site="pos:apex",
-                               group="multi", est_s=95, static=[b], swept=a,
-                               detail=f"{b} 는 그대로 둔 채 {a} 만 게이지로 누릅니다:"))
-    if len(ids) >= 4:
-        static = ids[:3]
-        steps.append(Step("instruction", "3개 정하중 (전체 파지 상황)", reference="none",
-                          detail=f"{', '.join(static)} 를 각각 약 {hint:g} N 으로 눌러 고정",
+    for swept in ids:
+        static = [i for i in ids if i != swept]
+        steps.append(Step("instruction", f"{swept} 외 {len(static)}개 정하중", reference="none",
+                          detail=(f"{', '.join(static)} 를 클램프 또는 분동으로 각각 약 {hint:g} N 으로 눌러 고정하고, "
+                                  f"{swept} 는 비워 둡니다. 값은 정확하지 않아도 됩니다 (변하지 않기만 하면 됩니다)"),
                           tags={"static": static}))
-        steps.append(free_step(ctx, f"{ids[3]} 스윕 (3개 정하중)", ids[3], label=f"{ids[3]}|3static",
-                               site="pos:apex", group="multi", est_s=95, static=static, swept=ids[3],
-                               detail=f"{ids[3]} 만 게이지로 누릅니다:"))
+        steps.append(press_step(ctx, f"{swept} 누름 ({len(static)}개 정하중)", by_id[swept],
+                                label=f"{swept}|{len(static)}static", site="pos:apex", group="multi",
+                                static=static, swept=swept,
+                                detail=f"나머지는 그대로 둔 채 {swept} 만 게이지로 누릅니다. 정렬 후 [Space]"))
+    return steps + v2_suffix(ctx)
+
+
+def build_rm5(ctx):
+    """판 누름: 한 손 4개 위에 평판을 올리고 판 중앙을 누른다. 4개의 합력 |ΣF| 를 게이지와 비교."""
+    ids = [s.id for s in ctx.sensors]
+    total_fs = sum(s.rated_N for s in ctx.sensors)
+    steps = v2_prefix(ctx)
+    steps.append(Step("instruction", "판 올리기", reference="none",
+                      detail=(f"센서 {', '.join(ids)} 를 같은 방향(정점이 위)으로 고정하고, 평판을 네 정점 위에 올립니다. "
+                              "판이 4개 모두에 닿고 흔들리지 않는지 확인. 게이지는 판 중앙을 누릅니다")))
+    steps.append(Step("record", "판 무게 기록", detail="판만 올려 둔 채 손대지 않고 [Space]. 이 값을 판 무게로 빼고 봅니다",
+                      target_N=0.0, duration_s=ctx.dur(float(ctx.v2get("plate_base_s", 5))), action="plate_base",
+                      sensors=ids))
+    steps.append(press_step(ctx, "판 누름 (4개 합력)", ctx.dut, label="판", site="plate", group="plate",
+                            fs=total_fs, plate=ids,
+                            detail=f"게이지로 판 중앙을 수직으로 누릅니다. 안내 세기는 4개에 걸리는 전체 힘입니다. 정렬 후 [Space]"))
+    steps.append(Step("instruction", "판 내리기", detail="판을 치운 뒤 [확인]", reference="none"))
     return steps + v2_suffix(ctx)
 
 
@@ -490,24 +524,31 @@ def build_rm4(ctx):
 
 TESTS: Dict[str, TestDef] = {t.code: t for t in [
     # ── v2 (test-plan-v2.md) ──
-    TestDef("R0", "정지 (영점·노이즈)", "single", "무하중 90초, 접촉 없음", "0",
-            "영점 평균·1σ·p-p, 드리프트 (6축 + |F|)", build_r0),
-    TestDef("R1", "정점 스윕 (핵심)", "single", "정점 1점, 램프·펄스·홀드·스텝 자유 혼합", "0 → 거의 F.S.",
-            "|F| 기울기·비선형성·히스테리시스·반복성·크리프·영점 복귀·크로스토크·방향 안정성·동적 응답",
-            build_r1),
-    TestDef("R2", "위치 스윕", "single", "정점 + 가장자리 4지점, 위치마다 재정렬", "~50 % F.S.",
-            "위치별 기울기, 위치 간 편차, 위치별 평균 방향, 정렬 진단", build_r2),
-    TestDef("R3", "방향별 (축)", "single", "법선이 ±x·±y 인 면을 90° 지그로", "0 → 거의 F.S.",
-            "방향별 |F| 기울기, 지배 성분 비율, 방향 안정성", build_r3),
-    TestDef("RM1", "샘플레이트·패킷 손실", "multi", "무하중 60초. 연결 수 1/2/4 로 반복", "0",
+    TestDef("R0", "정지 (영점·노이즈)", "single", "무하중 15초, 접촉 없음", "0",
+            "영점 평균·1σ·드리프트", build_r0),
+    TestDef("R1", "정점 (핵심)", "single", "정점 1점, 누름 블록 + 빠른 입력",
+            "3/6/9/12 N × 3회, 각 3초 유지·3초 휴식",
+            "힘별 오차(N), 반복 산포, 영점 복귀, 응답 시간(상승·하강)", build_r1),
+    TestDef("R2", "위치별", "single", "±x 2지점, 위치마다 재정렬 후 누름 블록. 정점은 R1 결과를 기준으로 씀",
+            "3/6/9/12 N × 2회", "위치별 오차(N), 같은 힘에서 R1 정점 대비 차이", build_r2),
+    # R3 (방향별, 90° 지그로 ±x 옆면) 은 2026-09-30 드랍. 다시 쓰려면 주석 해제 (build_r3·a_r3 는 남아 있음)
+    # TestDef("R3", "방향별 (축)", "single", "법선이 ±x 인 옆면을 90° 지그로, 누름 블록",
+    #         "20/50/80 % F.S. × 2회", "방향별 오차(N), 정점(R1) 대비 차이", build_r3),
+    TestDef("R4", "세션 간 재현성", "single", "재연결·재장착 후 짧은 정점 누름 블록. 센서마다 2회",
+            "3/6/9/12 N × 1회", "같은 힘에서 세션별 오차의 산포(N) — R1 과 이전 R4 포함", build_r4),
+    TestDef("RM1", "샘플레이트·패킷 손실", "multi", "무하중 15초. 연결 수 1/2/4 로 반복", "0",
             "실효 Hz, 프레임 누락, 지터", build_rm1, 1, 10),
-    TestDef("RM2", "다중 연결 정확도·간섭·매핑", "multi", "한 손 연결 상태로 센서마다 정점 스윕",
-            "센서당 램프 2 + 펄스 5", "단일(R1) 대비 기울기·절편 차이, 무하중 채널 변화, 채널 매핑",
+    TestDef("RM2", "다중 연결 정확도·간섭·매핑", "multi", "한 손 연결 상태로 센서마다 누름 블록",
+            "3/6/9/12 N × 2회", "단일(R1) 대비 오차 차이(N), 무하중 채널 변화, 채널 매핑",
             build_rm2, 2, 10),
-    TestDef("RM3", "동시 하중", "multi", "한 센서에 정하중을 건 채 다른 센서를 스윕", "정하중 + 스윕",
-            "스윕 센서 정확도, 정하중 센서 출력 안정성", build_rm3, 2, 10),
+    TestDef("RM3", "동시 하중", "multi", "센서마다 차례로: 나머지 3개에 정하중을 건 채 그 센서를 누름 블록 (전체 파지)",
+            "정하중 ~5 N × 3 + 누름 3/6/9/12 N × 2회, 4개 모두",
+            "누른 센서 오차 차이(N), 정하중 센서 출력 안정성", build_rm3, 2, 10),
     TestDef("RM4", "다중 장시간 안정성", "multi", "무하중 30분 (무인)", "0",
             "드리프트, 끊김·재연결", build_rm4, 2, 10),
+    TestDef("RM5", "판 누름 (4개 합력)", "multi", "한 손 4개 위에 평판, 판 중앙을 누름 블록",
+            "전체 12/24/36/48 N (센서당 평균 3/6/9/12) × 2회", "4개 합력 |ΣF| 오차(N), 센서별 하중 분담",
+            build_rm5, 2, 10),
     # ── v1 (이전 방식 · 정적 계단/분동) ──
     TestDef("S1", "영점 노이즈·드리프트", "single", "무하중 60초 기록", "0",
             "평균, 표준편차, 60초 드리프트", build_s1),

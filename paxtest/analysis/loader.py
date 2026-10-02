@@ -44,10 +44,10 @@ class SessionData:
 
     @property
     def segments(self) -> pd.DataFrame:
-        """자유 스윕 구간 (Step.kind == 'free') 목록. tags 에 label/site/coverage."""
+        """누름 블록 (Step.kind == 'press') 목록. tags 에 label/site/group/targets/levels_N."""
         if self.events.empty or "kind" not in self.events:
             return pd.DataFrame()
-        return self.events[self.events["kind"] == "free"].reset_index(drop=True)
+        return self.events[self.events["kind"] == "press"].reset_index(drop=True)
 
     def zero_windows(self) -> List[tuple]:
         """무하중 기록 구간 (t0, t1) — 영점·노이즈·드리프트용."""
@@ -74,7 +74,7 @@ def _pxsr_cfg(meta: Dict) -> Dict:
     cfg = dict(meta.get("config", {}).get("pxsr", {}))
     if meta.get("mode") == "sim":
         cfg.update({"timestamp_col": "timestamp", "timestamp_unit": "ms", "channel_col": None,
-                    "file_channel_regex": r"ch(\d+)", "fz_sign": 1,
+                    "file_channel_regex": r"ch(\d+)", "fz_sign": 1, "force_scale": 1.0, "taxel_geometry": None,
                     "columns": {k: k for k in FORCE_KEYS}})
     return cfg
 
@@ -102,7 +102,11 @@ def load_session(session_dir: Path) -> SessionData:
     px = load_pxsr_files(files, _pxsr_cfg(meta))
     ch_map = {int(s["channel"]): s["id"] for s in sensors}
     if len(sensors) == 1:
-        px["sensor"] = sensors[0]["id"]      # 단일 센서: 채널 번호와 무관
+        # 단일 센서: 채널 번호와 무관. 단, 한 파일에 센서가 여럿(PXSR wide)이면 설정 채널만 쓴다
+        chans = set(px["channel"].unique())
+        if len(chans) > 1 and int(sensors[0]["channel"]) in chans:
+            px = px[px["channel"] == int(sensors[0]["channel"])].copy()
+        px["sensor"] = sensors[0]["id"]
     else:
         px["sensor"] = px["channel"].map(ch_map)
         px = px[px["sensor"].notna()]

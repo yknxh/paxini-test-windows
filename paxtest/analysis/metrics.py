@@ -31,6 +31,28 @@ LABELS = {
     "offset_diff_N": ("S2 대비 절편 차이", "N"), "max_channel_crosstalk_N": ("타 채널 최대 변화", "N"),
     "mapping_ok": ("채널 매핑 일치", ""), "error_pct": ("오차", "%"),
 }
+# 그림(비교 리포트 막대그래프)용 영어 라벨. 표·판정은 LABELS 를 쓴다
+LABELS_EN = {
+    "slope": ("Slope", ""), "intercept": ("Intercept", "N"), "r2": ("R²", ""),
+    "nonlin_pct_fs": ("Nonlinearity", "% F.S."), "max_error_pct_fs": ("Max error", "% F.S."),
+    "hysteresis_pct_fs": ("Hysteresis", "% F.S."), "repeatability_pct_fs": ("Repeatability (1σ)", "% F.S."),
+    "zero_residual_N": ("Zero residual (max)", "N"), "crosstalk_Fx_pct": ("Crosstalk Fx/Fz", "%"),
+    "crosstalk_Fy_pct": ("Crosstalk Fy/Fz", "%"), "crosstalk_Tx": ("Tx/Fz", "mN·m/N"),
+    "crosstalk_Ty": ("Ty/Fz", "mN·m/N"), "crosstalk_Tz": ("Tz/Fz", "mN·m/N"),
+    "zero_mean_N": ("Zero-load mean", "N"), "noise_std_N": ("Noise (1σ)", "N"), "noise_p2p_N": ("Noise (p-p)", "N"),
+    "drift_N": ("Drift (whole window)", "N"), "drift_N_per_min": ("Drift", "N/min"),
+    "rate_hz": ("Effective sample rate", "Hz"), "jitter_ms": ("Interval jitter (1σ)", "ms"),
+    "drop_pct": ("Dropped frames", "%"), "dropped_frames": ("Dropped frame count", ""),
+    "gaps_1s": ("Gaps ≥ 1 s", "count"),
+    "worst_error_pct": ("Max relative error", "%"), "worst_error_N": ("Max absolute error", "N"),
+    "mean_error_N": ("Mean error", "N"), "position_spread_pct": ("Spread across positions", "%"),
+    "creep_pct": ("Creep (60 s)", "% of reading"), "residual_N": ("Residual after release", "N"),
+    "recovery_s": ("Zero recovery time", "s"), "delay_ms": ("Delay vs. gauge", "ms"),
+    "rise_ms": ("Rise time 10→90%", "ms"), "overshoot_pct": ("Overshoot", "%"),
+    "slope_diff_pct": ("Slope diff vs. S2", "%"), "offset_diff_N": ("Offset diff vs. S2", "N"),
+    "max_channel_crosstalk_N": ("Max change on other channels", "N"),
+    "mapping_ok": ("Channel mapping match", ""), "error_pct": ("Error", "%"),
+}
 
 
 @dataclass
@@ -166,7 +188,7 @@ def a_record_noise(sd, st, res, crit, pdir, zero_checks=True):
                 res.check(sid, "drift_N", slope * (t[-1] - t[0]), crit["zero_residual_N"])
             items.append((sid, t - t[0], y, colors[sid], "-"))
         if items:
-            res.plot(P.curves(pdir / f"zero_{sid}.png", items, f"{sid} · 무하중 출력", "시간 (s)", "Fz (N)",
+            res.plot(P.curves(pdir / f"zero_{sid}.png", items, f"{sid} · Zero-load output", "Time (s)", "Fz (N)",
                               band=crit["zero_residual_N"]), f"{sid} 무하중 Fz. 회색 띠 = ±영점 기준")
 
 
@@ -229,9 +251,9 @@ def a_s3(sd, st, res, crit, pdir):
     res.metric(sid, "mean_error_N", d["error_N"].mean())
     labels = [f"{w:g}" for w in g["target_N"]]
     fig_name = P.bars(pdir / f"weights_{sid}.png", labels,
-                      {"평균 오차": (g["mean"].tolist(), g["std"].fillna(0).tolist())},
-                      {"평균 오차": _colors(sd)[sid]}, f"{sid} · 분동별 오차 (막대 = 평균, 오차막대 = 1σ)",
-                      "오차 (N)", value_fmt="{:+.3f}")
+                      {"Mean error": (g["mean"].tolist(), g["std"].fillna(0).tolist())},
+                      {"Mean error": _colors(sd)[sid]}, f"{sid} · Error per weight (bar = mean, error bar = 1σ)",
+                      "Error (N)", value_fmt="{:+.3f}")
     res.plot(fig_name, "x축 = 분동 하중 (N)")
 
 
@@ -253,10 +275,10 @@ def a_s4(sd, st, res, crit, pdir):
         res.metric(sid, "zero_residual_N", zr)
         res.check(sid, "zero_residual_N", zr, crit["zero_residual_N"])
     c = _colors(sd)[sid]
-    items = [("하중 시 오차 (Paxini - 게이지)", ld["rep"].to_numpy(), ld["error_N"].to_numpy(), c, "-")]
+    items = [("Loaded error (Paxini - gauge)", ld["rep"].to_numpy(), ld["error_N"].to_numpy(), c, "-")]
     if len(zd):
-        items.append(("해제 시 잔류", zd["rep"].to_numpy(), zd["Fz_mean"].to_numpy(), P.GAUGE, "--"))
-    res.plot(P.curves(pdir / f"repeat_{sid}.png", items, f"{sid} · 반복별 오차", "반복 번호", "N"),
+        items.append(("Residual after release", zd["rep"].to_numpy(), zd["Fz_mean"].to_numpy(), P.GAUGE, "--"))
+    res.plot(P.curves(pdir / f"repeat_{sid}.png", items, f"{sid} · Error per repetition", "Repetition", "N"),
              "30 % F.S. 반복 load/unload")
 
 
@@ -282,7 +304,7 @@ def a_s5(sd, st, res, crit, pdir):
         series[name] = (gg["mean"].tolist(), gg["std"].fillna(0).tolist())
         colors[name] = P.SERIES[i]
     res.plot(P.bars(pdir / f"position_{sid}.png", order, series, colors,
-                    f"{sid} · 위치별 오차 (Paxini/게이지 - 1)", "오차 (%)", value_fmt="{:+.1f}"),
+                    f"{sid} · Error per position (Paxini/gauge - 1)", "Error (%)", value_fmt="{:+.1f}"),
              "막대 = 반복 평균, 오차막대 = 1σ")
 
 
@@ -305,10 +327,10 @@ def a_s6(sd, st, res, crit, pdir):
                 ax.annotate(f"{v:.2f}", (k, v), textcoords="offset points", xytext=(0, 3), ha="center",
                             fontsize=7.5, color=P.INK2)
             ax.set_ylabel(unit)
-        axes[0, 0].axhline(crit["crosstalk_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"기준 {crit['crosstalk_pct']:g} %")
+        axes[0, 0].axhline(crit["crosstalk_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"Limit {crit['crosstalk_pct']:g} %")
         axes[0, 0].legend()
-        axes[0, 0].set_title(f"{sid} · 힘 크로스토크")
-        axes[0, 1].set_title("토크 크로스토크")
+        axes[0, 0].set_title(f"{sid} · Force crosstalk")
+        axes[0, 1].set_title("Torque crosstalk")
         res.plot(P.save(fig, pdir / f"crosstalk_{sid}.png"), "순수 Fz 하중(≥ 50 % F.S.)에서 다른 축 출력")
 
 
@@ -329,7 +351,7 @@ def a_s7(sd, st, res, crit, pdir):
             m1 = (t > t[-1] - 2)
             creep = (y[m1].mean() - y[m0].mean()) / max(1e-6, y[m0].mean()) * 100
             creeps.append(creep)
-            creep_items.append((f"반복 {k + 1}", t - t[0], y - y[m0].mean(), P.SERIES[k % 8], "-"))
+            creep_items.append((f"Rep {k + 1}", t - t[0], y - y[m0].mean(), P.SERIES[k % 8], "-"))
     for k, (_, r) in enumerate(rels.iterrows()):
         t, y = series_in(sd, sid, r["t_start"] - 1, r["t_end"])
         tg, g = gauge_in(sd, r["t_start"] - 1, r["t_end"])
@@ -351,7 +373,7 @@ def a_s7(sd, st, res, crit, pdir):
         resid = float(dev[t > t[-1] - tail].mean())
         resids.append(resid)
         recs.append(rec)
-        rel_items.append((f"반복 {k + 1}", t - t_rel, dev, P.SERIES[k % 8], "-"))
+        rel_items.append((f"Rep {k + 1}", t - t_rel, dev, P.SERIES[k % 8], "-"))
     sidc = sid
     if creeps:
         res.metric(sidc, "creep_pct", float(np.max(np.abs(creeps))), label="크리프 (60초, 최대)")
@@ -367,10 +389,10 @@ def a_s7(sd, st, res, crit, pdir):
             res.notes.append("일부 반복에서 기록 구간 안에 영점 기준 이내로 복귀하지 못함")
     if creep_items or rel_items:
         res.plot(P.two_panel_curves(pdir / f"creep_recovery_{sid}.png",
-                                    {"items": creep_items, "title": f"{sid} · 유지 중 변화 (크리프)",
-                                     "xlabel": "유지 시작 후 (s)", "ylabel": "ΔFz (N)", "band": None},
-                                    {"items": rel_items, "title": "해제 후 영점 복귀 (확대)",
-                                     "xlabel": "해제 후 (s)", "ylabel": "Fz - 기준 (N)", "band": thr,
+                                    {"items": creep_items, "title": f"{sid} · Change during hold (creep)",
+                                     "xlabel": "Time since hold start (s)", "ylabel": "ΔFz (N)", "band": None},
+                                    {"items": rel_items, "title": "Zero recovery after release (zoom)",
+                                     "xlabel": "Time since release (s)", "ylabel": "Fz - baseline (N)", "band": thr,
                                      "xlim": (-0.5, None),
                                      "ylim": (-max(0.5, 4 * thr), max(0.5, 4 * thr, 1.5 * max(abs(x) for x in resids)))
                                      if resids else None}),
@@ -396,7 +418,7 @@ def a_s8(sd, st, res, crit, pdir):
         rises.append((_cross(t, yn, 0.9) - _cross(t, yn, 0.1)) * 1000)
         rises_g.append((_cross(tg, gn, 0.9) - _cross(tg, gn, 0.1)) * 1000)
         overs.append((y.max() - yf) / (yf - y0) * 100)
-        items.append((f"게이지 {k + 1}" if k == 0 else "_", tg - tg50, gn, P.GAUGE, "--"))
+        items.append((f"Gauge {k + 1}" if k == 0 else "_", tg - tg50, gn, P.GAUGE, "--"))
         items.append((f"Paxini {k + 1}" if k == 0 else "_", t - tg50, yn, c, "-"))
     if not delays:
         res.notes.append("스텝 입력을 검출하지 못함")
@@ -408,10 +430,10 @@ def a_s8(sd, st, res, crit, pdir):
     res.notes.append("게이지 샘플링(약 50 Hz)이 지연·상승 시간 분해능을 제한함. 참고값으로 해석")
     for i in range(len(items)):
         lab, x, y, col, ls = items[i]
-        items[i] = ("게이지" if lab.startswith("게이지") else "Paxini" if lab.startswith("Paxini") else "_nolegend_",
+        items[i] = ("Gauge" if lab.startswith("Gauge") else "Paxini" if lab.startswith("Paxini") else "_nolegend_",
                     x, y, col, ls)
-    res.plot(P.curves(pdir / f"step_{sid}.png", items, f"{sid} · 스텝 응답 (게이지 50 % 시점 정렬)",
-                      "시간 (s)", "정규화 출력", xlim=(-0.3, 0.7)), "점선 = 게이지, 실선 = Paxini, 반복 전체 겹침")
+    res.plot(P.curves(pdir / f"step_{sid}.png", items, f"{sid} · Step response (aligned at gauge 50 %)",
+                      "Time (s)", "Normalized output", xlim=(-0.3, 0.7)), "점선 = 게이지, 실선 = Paxini, 반복 전체 겹침")
 
 
 def a_s9(sd, st, res, crit, pdir):
@@ -431,8 +453,8 @@ def a_s9(sd, st, res, crit, pdir):
         res.metric(sid, "drift_N_per_min", np.polyfit((t - t[0]) / 60, err, 1)[0], label="오차 드리프트 (게이지 대비)")
     items = [("Paxini Fz", (t - t[0]) / 60, y, _colors(sd)[sid], "-")]
     if len(tg):
-        items.append(("게이지", (tg - t[0]) / 60, g, P.GAUGE, "--"))
-    res.plot(P.curves(pdir / f"longterm_{sid}.png", items, f"{sid} · 장시간 유지", "분", "N"), "30 % F.S. 유지")
+        items.append(("Gauge", (tg - t[0]) / 60, g, P.GAUGE, "--"))
+    res.plot(P.curves(pdir / f"longterm_{sid}.png", items, f"{sid} · Long-term hold", "Time (min)", "N"), "30 % F.S. 유지")
 
 
 def a_rate(sd, st, res, crit, pdir, long_term=False):
@@ -478,18 +500,18 @@ def a_rate(sd, st, res, crit, pdir, long_term=False):
     ax1, ax2 = axes[0]
     cols = [colors[s] for s in labels]
     ax1.bar(labels, rates, 0.6, color=cols)
-    ax1.plot(labels, noms, "_", color=P.INK, ms=22, mew=1.5, label="기대 샘플레이트")
-    ax1.set_title(f"실효 샘플레이트 ({len(labels)}개 연결)")
+    ax1.plot(labels, noms, "_", color=P.INK, ms=22, mew=1.5, label="Expected rate")
+    ax1.set_title(f"Effective sample rate ({len(labels)} connected)")
     ax1.set_ylabel("Hz")
     ax1.legend(loc="lower right")
     ax2.bar(labels, drops, 0.6, color=cols)
-    ax2.axhline(crit["frame_drop_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"기준 {crit['frame_drop_pct']:g} %")
-    ax2.set_title("프레임 누락")
+    ax2.axhline(crit["frame_drop_pct"], color=P.CRITICAL, ls="--", lw=1, label=f"Limit {crit['frame_drop_pct']:g} %")
+    ax2.set_title("Dropped frames")
     ax2.set_ylabel("%")
     ax2.legend()
     res.plot(P.save(fig, pdir / "rate.png"), "센서별 실효 샘플레이트와 프레임 누락")
     if items:
-        res.plot(P.curves(pdir / "longterm.png", items, "무하중 장시간 출력", "분", "Fz (N)",
+        res.plot(P.curves(pdir / "longterm.png", items, "Zero-load long-term output", "Time (min)", "Fz (N)",
                           band=crit["zero_residual_N"]), "센서별 무하중 출력 추이")
 
 
@@ -530,8 +552,8 @@ def a_m2(sd, st, res, crit, pdir):
             fs = sd.fs(sid)
             items.append((sid, d["ref_N"].to_numpy() / fs * 100, (d["Fz_mean"] - d["ref_N"]).to_numpy() / fs * 100,
                           colors[sid], "-"))
-        res.plot(P.curves(pdir / "multi_error.png", items, "다중 연결 상태 센서별 오차", "하중 (% F.S.)",
-                          "오차 (% F.S.)"), "센서별 축약 계단 (상승→하강)")
+        res.plot(P.curves(pdir / "multi_error.png", items, "Error per sensor (multi-connected)", "Load (% F.S.)",
+                          "Error (% F.S.)"), "센서별 축약 계단 (상승→하강)")
 
 
 def a_m3(sd, st, res, crit, pdir):
@@ -552,8 +574,8 @@ def a_m3(sd, st, res, crit, pdir):
         res.metric(s, "max_channel_crosstalk_N", worst, label="이 센서 하중 시 타 채널 최대 변화")
         res.check(s, "max_channel_crosstalk_N", worst, crit["channel_crosstalk_N"])
     res.tables["채널 간 간섭 (N)"] = pd.DataFrame(m, index=[f"하중:{s}" for s in ids], columns=ids)
-    res.plot(P.matrix(pdir / "channel_crosstalk.png", m, ids, ids, "채널 간 간섭 (무하중 센서 출력 변화)", "|ΔFz| (N)",
-                      fmt="{:+.3f}", row_title="하중을 준 센서", col_title="관찰 센서"),
+    res.plot(P.matrix(pdir / "channel_crosstalk.png", m, ids, ids, "Channel crosstalk (output change of unloaded sensors)", "|ΔFz| (N)",
+                      fmt="{:+.3f}", row_title="Loaded sensor", col_title="Observed sensor"),
              "행 센서에 100 % F.S. 를 줬을 때 열 센서의 출력 변화")
 
 
@@ -578,9 +600,9 @@ def a_m4(sd, st, res, crit, pdir):
                 vals.append(err)
             else:
                 vals.append(np.nan)
-        series[name] = (vals, None)
-        colors_s[name] = P.SERIES[k]
-    res.plot(P.bars(pdir / "simultaneous.png", ids, series, colors_s, "동시 하중 시 센서별 오차", "오차 (N)",
+        series[f"{len(loaded)} simultaneous"] = (vals, None)
+        colors_s[f"{len(loaded)} simultaneous"] = P.SERIES[k]
+    res.plot(P.bars(pdir / "simultaneous.png", ids, series, colors_s, "Error per sensor under simultaneous load", "Error (N)",
                     value_fmt="{:+.2f}"), "같은 분동을 여러 센서에 동시에 올렸을 때")
 
 
@@ -603,8 +625,8 @@ def a_m5(sd, st, res, crit, pdir):
                       label=f"탭 → 가장 크게 반응한 센서 = {got}")
             res.metric(exp, "mapping_ok", 1.0 if got == exp else 0.0)
     res.tables["탭 응답 피크 (N)"] = pd.DataFrame(m, index=[f"탭:{r}" for r in rows], columns=ids)
-    res.plot(P.matrix(pdir / "mapping.png", m, rows, ids, "채널 식별 (탭 응답 피크)", "피크 |ΔFz| (N)",
-                      row_title="탭한 센서 (안내)", col_title="PXSR 채널 → 센서 매핑"),
+    res.plot(P.matrix(pdir / "mapping.png", m, rows, ids, "Channel identification (tap response peak)", "Peak |ΔFz| (N)",
+                      row_title="Tapped sensor (prompted)", col_title="PXSR channel → sensor mapping"),
              "대각선만 진하면 매핑 정상")
 
 
